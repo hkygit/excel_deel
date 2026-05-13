@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-推送代码到Gitee.py - 将当前项目的所有更改提交并推送到 Gitee 远程仓库
-功能：自动 add/commit/push，要求用户输入提交信息，检测冲突并提示
-增强：自动忽略 Excel/ 目录（添加到 .gitignore）
+推送代码到 Gitee（增强版）
+- 自动完善 .gitignore（忽略 Excel、exe、大文件、临时文件、输出目录等）
+- 自动排除所有文件名包含中文的文件及中文目录
+- 支持强制推送（失败后询问）
 """
 
 import os
@@ -11,32 +12,112 @@ import sys
 import subprocess
 import re
 
+# ========== 忽略规则（会合并到 .gitignore） ==========
+EXTRA_IGNORE = """
+# 运行时生成目录
+uploads/
+outputs/
+task_status/
+logs/
 
-def ensure_gitignore_ignore_excel():
-    """确保 .gitignore 文件中包含 Excel/ 忽略规则"""
+# 备份目录
+.git.backup/
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+env/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 临时文件
+*.tmp
+*.bak
+*.log
+*.cache
+
+# 大文件（数据/模型/压缩包）
+*.zip
+*.tar.gz
+*.7z
+*.rar
+*.iso
+*.bin
+*.dat
+*.pkl
+*.joblib
+*.parquet
+*.feather
+*.pth
+*.ckpt
+*.pb
+*.onnx
+*.h5
+*.npy
+
+# 测试覆盖
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 环境变量
+.env
+.env.*
+
+# 可执行文件
+*.exe
+*.msi
+
+# Excel 文件（所有格式）
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*.xltx
+*.xltm
+
+# 其他媒体大文件（可选，按需）
+*.pdf
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.mp3
+*.wav
+"""
+
+def ensure_gitignore():
+    """确保 .gitignore 包含必要的忽略规则（不覆盖已有）"""
     gitignore_path = ".gitignore"
-    ignore_line = "Excel/"
-
-    # 如果 .gitignore 不存在，创建并写入
-    if not os.path.exists(gitignore_path):
-        with open(gitignore_path, "w", encoding="utf-8") as f:
-            f.write(f"{ignore_line}\n")
-        print("✓ 已创建 .gitignore 并添加 Excel/ 忽略规则")
-        return
-
-    # 检查是否已存在该规则
-    with open(gitignore_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    if any(line.strip() == ignore_line.rstrip('/') or line.strip() == ignore_line for line in lines):
-        print("✓ .gitignore 已包含 Excel/ 忽略规则")
-        return
-
-    # 追加规则
-    with open(gitignore_path, "a", encoding="utf-8") as f:
-        f.write(f"\n{ignore_line}\n")
-    print("✓ 已向 .gitignore 添加 Excel/ 忽略规则")
-
+    # 读取已有内容
+    existing_lines = []
+    if os.path.exists(gitignore_path):
+        with open(gitignore_path, "r", encoding="utf-8") as f:
+            existing_lines = f.read().splitlines()
+    # 合并新规则（去重）
+    new_rules = []
+    for line in EXTRA_IGNORE.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line not in existing_lines:
+            new_rules.append(line)
+    if new_rules:
+        with open(gitignore_path, "a", encoding="utf-8") as f:
+            f.write("\n" + "\n".join(new_rules) + "\n")
+        print(f"✓ 已向 .gitignore 追加 {len(new_rules)} 条规则")
+    else:
+        print("✓ .gitignore 已包含所有必要规则")
 
 def run_git_command(cmd):
     """执行 Git 命令，返回 (returncode, stdout, stderr)"""
@@ -49,60 +130,30 @@ def run_git_command(cmd):
             encoding='utf-8',
             errors='replace'
         )
-        stdout = result.stdout.strip() if result.stdout is not None else ""
-        stderr = result.stderr.strip() if result.stderr is not None else ""
-        return result.returncode, stdout, stderr
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
     except Exception as e:
         return 1, "", str(e)
 
-
 def is_git_repo():
-    """检查当前目录是否为 Git 仓库"""
     return os.path.isdir(".git")
 
-
 def get_current_branch():
-    """获取当前分支名"""
-    ret, branch, err = run_git_command("git rev-parse --abbrev-ref HEAD")
-    if ret != 0:
-        return None
-    return branch
-
-
-def show_status():
-    """显示当前 Git 状态"""
-    ret, status, err = run_git_command("git status")
-    if ret == 0:
-        print("\n当前 Git 状态：")
-        print(status)
-    else:
-        print("无法获取 Git 状态：", err)
-
+    ret, branch, _ = run_git_command("git rev-parse --abbrev-ref HEAD")
+    return branch if ret == 0 else None
 
 def has_changes():
-    """检查是否有未提交的更改（排除 Excel/ 目录）"""
     ret, status, _ = run_git_command("git status --porcelain")
-    if ret != 0:
-        return False
-    # 如果 status 为空，则无更改
-    if not status:
-        return False
-    # 可选：进一步过滤掉 Excel/ 目录的更改（但 .gitignore 已经处理，无需额外过滤）
-    return True
-
+    return ret == 0 and bool(status)
 
 def add_all():
-    """添加所有更改到暂存区（Excel/ 目录已被 .gitignore 忽略）"""
     ret, _, err = run_git_command("git add .")
     if ret != 0:
         print("添加文件失败：", err)
         return False
-    print("✓ 已添加所有更改（已忽略 Excel/ 目录）")
+    print("✓ 已添加所有更改（已遵守 .gitignore）")
     return True
 
-
 def commit(message):
-    """提交更改"""
     ret, _, err = run_git_command(f'git commit -m "{message}"')
     if ret != 0:
         print("提交失败：", err)
@@ -110,59 +161,113 @@ def commit(message):
     print("✓ 提交成功")
     return True
 
+def remove_chinese_items():
+    """从暂存区移除所有文件名包含中文的文件，以及目录名包含中文的目录"""
+    ret, files, _ = run_git_command("git ls-files --cached")
+    if ret != 0 or not files:
+        return
 
-def push(branch):
-    """推送到远程仓库"""
-    print(f"正在推送到远程仓库（分支 {branch}）...")
-    ret, out, err = run_git_command(f"git push origin {branch}")
+    chinese_files = []
+    chinese_dirs = set()
+    for f in files.splitlines():
+        f = f.strip()
+        if not f:
+            continue
+        # 检查文件名（不含路径）是否含中文
+        basename = os.path.basename(f)
+        if re.search(r'[\u4e00-\u9fff]', basename):
+            chinese_files.append(f)
+            continue
+        # 检查路径中的每一级目录是否含中文
+        parts = f.split('/')
+        for i in range(len(parts)-1):
+            if re.search(r'[\u4e00-\u9fff]', parts[i]):
+                prefix = '/'.join(parts[:i+1])
+                chinese_dirs.add(prefix)
+                break
+
+    if chinese_files:
+        print(f"发现 {len(chinese_files)} 个文件名含中文的文件，正在从索引移除...")
+        for f in chinese_files:
+            run_git_command(f'git rm --cached --ignore-unmatch "{f}"')
+        print("✓ 已移除中文名文件")
+    if chinese_dirs:
+        print(f"发现 {len(chinese_dirs)} 个目录名含中文的目录，正在递归移除...")
+        for d in chinese_dirs:
+            run_git_command(f'git rm -r --cached --ignore-unmatch "{d}/"')
+        print("✓ 已移除中文目录下的所有内容")
+
+def push(branch, force=False):
+    cmd = f"git push origin {branch}"
+    if force:
+        cmd += " --force"
+        print("⚠️ 使用强制推送（--force）")
+    print(f"执行: {cmd}")
+    ret, _, err = run_git_command(cmd)
     if ret != 0:
-        if "failed to push" in err.lower() or "rejected" in err.lower():
-            print("\n推送失败！远程仓库可能有更新。")
-            print("建议先执行 `git pull` 合并远程更改，再重新推送。")
+        if "rejected" in err.lower() or "failed" in err.lower():
+            print("\n推送失败：远程仓库可能有更新。")
+            if not force:
+                print("提示：可以尝试强制推送（--force）覆盖远程。")
         else:
             print("推送失败：", err)
         return False
     print("✓ 推送成功")
     return True
 
-
 def main():
-    print("=== 推送代码到 Gitee ===")
-
+    print("=== 推送代码到 Gitee（增强版） ===")
     if not is_git_repo():
-        print("错误：当前目录不是 Git 仓库，请在项目根目录运行")
+        print("错误：当前目录不是 Git 仓库")
         sys.exit(1)
 
-    # 确保 Excel/ 目录被 Git 忽略
-    ensure_gitignore_ignore_excel()
+    ensure_gitignore()
 
     branch = get_current_branch()
     if not branch:
-        print("无法获取当前分支，请检查仓库状态")
+        print("无法获取当前分支")
         sys.exit(1)
     print(f"当前分支：{branch}")
 
-    show_status()
+    # 显示状态
+    ret, status, _ = run_git_command("git status")
+    if ret == 0:
+        print("\n当前 Git 状态：")
+        print(status)
 
     if not has_changes():
         print("\n没有需要提交的更改，程序退出。")
         return
 
-    # 获取提交消息
-    commit_msg = input("\n请输入提交信息（可直接回车使用默认消息）: ").strip()
+    commit_msg = input("\n请输入提交信息（直接回车使用默认）: ").strip()
     if not commit_msg:
         commit_msg = "更新代码"
 
-    # 执行 add, commit, push
     if not add_all():
         sys.exit(1)
+
+    # 移除中文名文件/目录
+    remove_chinese_items()
+
     if not commit(commit_msg):
         sys.exit(1)
-    if not push(branch):
+
+    # 询问是否强制推送
+    print("\n准备推送到远程仓库...")
+    force = False
+    choice = input("是否使用强制推送（--force）？这会覆盖远程历史，请确认 (y/N): ").strip().lower()
+    if choice == 'y':
+        force = True
+        print("\n⚠️ 您已确认强制推送，本地版本将完全覆盖远程仓库。")
+        confirm = input("再次确认，输入 'YES' 继续: ").strip()
+        if confirm != 'YES':
+            print("已取消强制推送，程序退出。")
+            sys.exit(0)
+
+    if not push(branch, force=force):
         sys.exit(1)
 
-    print("\n所有操作完成！")
-
+    print("\n🎉 所有操作完成！")
 
 if __name__ == "__main__":
     main()

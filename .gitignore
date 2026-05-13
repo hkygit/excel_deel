@@ -65,3 +65,15 @@ Excel/
 # === 压缩备份 ===
 *.backup
 *.old
+
+uploads/
+outputs/
+task_status/
+logs/
+.git.backup/
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.env.*
