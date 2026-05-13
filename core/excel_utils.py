@@ -125,3 +125,46 @@ def copy_merge_structure(src_ws, src_col, dst_ws, dst_col, start_row, end_row):
     ef = ExcelFile('')  # 占位，仅用于调用实例方法
     ef._workbook = src_ws.parent
     ef.copy_merge_structure(src_col, dst_col, start_row, end_row, sheet=dst_ws)
+
+
+# ========== 以下为兼容 ExcelService 而添加的静态方法 ==========
+
+    @staticmethod
+    def copy_cell_style(src_cell, dst_cell):
+        """复制单元格样式（兼容 ExcelFile.copy_cell_style）"""
+        from copy import copy
+        if src_cell.has_style:
+            dst_cell.font = copy(src_cell.font)
+            dst_cell.border = copy(src_cell.border)
+            dst_cell.fill = copy(src_cell.fill)
+            dst_cell.number_format = src_cell.number_format
+            dst_cell.alignment = copy(src_cell.alignment)
+            dst_cell.protection = copy(src_cell.protection)
+        dst_cell.value = src_cell.value
+
+    @staticmethod
+    def copy_merge_structure_static(ws, src_col, dst_col, start_row, end_row):
+        """
+        静态合并单元格结构复制（兼容 copy_merge_structure）
+        :param ws: 工作表对象
+        :param src_col: 源列（字母或数字索引）
+        :param dst_col: 目标列（字母或数字索引）
+        :param start_row: 起始行
+        :param end_row: 结束行
+        """
+        # 复用 ExcelFile 的实例方法，创建一个临时对象
+        ef = ExcelFile("")
+        ef._workbook = ws.parent
+        ef.copy_merge_structure(src_col, dst_col, start_row, end_row, sheet=ws)
+
+    @staticmethod
+    def get_cell_value_static(ws, row, col):
+        """
+        静态获取单元格值（兼容 ExcelFile.get_cell_value）
+        :param ws: 工作表对象
+        :param row: 行号
+        :param col: 列字母或数字索引
+        """
+        ef = ExcelFile("")
+        ef._workbook = ws.parent
+        return ef.get_cell_value(row, col, sheet=ws)

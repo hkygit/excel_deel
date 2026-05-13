@@ -9,7 +9,7 @@ from openpyxl import load_workbook, Workbook
 from copy import copy
 import pandas as pd
 
-from utils.validators import sanitize_filename
+from core.validators import sanitize_filename
 from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
 from core.filter_engine import parse_conditions_from_form, ConditionEngine

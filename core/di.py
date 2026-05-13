@@ -8,8 +8,8 @@ from services.data.writer import DataWriter
 from services.data.formatter import DataFormatter
 from services.data.file_service import FileService
 from services.excel.compute_engine import ComputeEngine
-from services.excel.filter_engine import FilterEngine
-from services.excel.excel_service import ExcelService
+from core.filter_engine import FilterEngine
+from core.excel_utils import ExcelFile
 from services.excel.calculator import ColumnCalculator
 from services.excel.comparator import ExcelComparator
 from services.excel.filter import ExcelFilter
@@ -31,7 +31,7 @@ class Container(containers.DeclarativeContainer):
     file_service = providers.Singleton(FileService)
     compute_engine = providers.Singleton(ComputeEngine)
     filter_engine = providers.Singleton(FilterEngine)
-    excel_service = providers.Singleton(ExcelService)
+    excel_service = providers.Singleton(ExcelFile)
     aggregator = providers.Singleton(Aggregator)
     column_calculator = providers.Singleton(ColumnCalculator)
     excel_comparator = providers.Singleton(ExcelComparator)

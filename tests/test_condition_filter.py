@@ -1,5 +1,5 @@
 import pandas as pd
-from utils.condition_filter import ConditionFilter, Condition
+from core.filter_engine import ConditionFilter, Condition
 
 class TestConditionFilter:
     def test_apply_to_dict_eq(self):

@@ -1,9 +1,9 @@
 import pandas as pd
 import pytest
 from services.excel.compute_engine import ComputeEngine
-from services.excel.filter_engine import FilterEngine
+from core.filter_engine import FilterEngine
 from services.excel.aggregator import Aggregator
-from utils.condition_filter import Condition
+from core.filter_engine import Condition
 
 class TestComputeEngine:
     def test_evaluate_expression(self):

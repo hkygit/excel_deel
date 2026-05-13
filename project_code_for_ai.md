@@ -2,7 +2,7 @@
 
 仓库: project
 过滤条件: 全部
-匹配文件数: 191
+匹配文件数: 151
 
 ---
 
@@ -32,6 +32,7 @@ from blueprints.field_parser import field_parser_bp
 from blueprints.checker import checker_bp
 from blueprints.convert import convert_bp
 from blueprints.team_report import team_report_bp
+from blueprints.transposer import transposer_bp
 
 def clean_old_files(directory, age_hours):
     now = time.time()
@@ -89,6 +90,7 @@ def create_app():
     app.register_blueprint(checker_bp, url_prefix='/checker')
     app.register_blueprint(convert_bp, url_prefix='/convert')
     app.register_blueprint(team_report_bp, url_prefix='/team-report')
+    app.register_blueprint(transposer_bp, url_prefix='/transposer')
 
     from services.simplify import init_config as init_simplify_config
     init_simplify_config(app)
@@ -1935,6 +1937,82 @@ def download(task_id):
     return response
 ```
 
+## blueprints/transposer.py
+
+```python
+import io
+import logging
+import pandas as pd
+from flask import Blueprint, render_template, request, send_file, current_app
+from core.decorators import handle_exceptions
+from core.exceptions import ValidationError
+from core.csv_utils import split_fields
+from services.transposer.service import pivot_table
+
+logger = logging.getLogger(__name__)
+transposer_bp = Blueprint('transposer', __name__, url_prefix='/transposer', template_folder='../templates/transposer')
+
+@transposer_bp.route('/')
+def index():
+    return render_template('transposer/index.html')
+
+@transposer_bp.route('/convert', methods=['POST'])
+@handle_exceptions()
+def convert():
+    if 'file' not in request.files:
+        raise ValidationError('未上传文件')
+    file = request.files['file']
+    if file.filename == '':
+        raise ValidationError('文件名为空')
+
+    # 读取参数
+    category_col_raw = request.form.get('category_col', '').strip()
+    value_cols_raw = request.form.get('value_cols', '').strip()
+    index_cols_raw = request.form.get('index_cols', '').strip()
+
+    if not category_col_raw:
+        raise ValidationError('请指定分类列')
+    if not value_cols_raw:
+        raise ValidationError('请指定值列（可多选）')
+
+    category_col = category_col_raw
+    value_cols = split_fields(value_cols_raw)
+    index_cols = split_fields(index_cols_raw) if index_cols_raw else None
+
+    # 读取 Excel
+    try:
+        df = pd.read_excel(file, dtype=str)
+    except Exception as e:
+        raise ValidationError(f'无法读取文件: {str(e)}')
+
+    # 校验列存在
+    all_needed = [category_col] + value_cols
+    if index_cols:
+        all_needed += index_cols
+    missing = [c for c in all_needed if c not in df.columns]
+    if missing:
+        raise ValidationError(f'列不存在: {", ".join(missing)}')
+
+    # 执行转置
+    try:
+        result_df = pivot_table(df, index_cols, category_col, value_cols)
+    except Exception as e:
+        raise ValidationError(f'转换失败: {str(e)}')
+
+    # 输出 Excel
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        result_df.to_excel(writer, index=False, sheet_name='转置结果')
+    output.seek(0)
+
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name='转置结果.xlsx',
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+```
+
 ## core/__init__.py
 
 ```python
@@ -3231,6 +3309,262 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', '_', str(name))
 ```
 
+## force_rebuild_and_push.py
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+强制重建 Git 仓库并推送到指定 Gitee 仓库
+- 删除所有历史
+- 忽略 .exe、所有 Excel 文件、中文名文件/目录
+- 自动处理大文件
+"""
+
+import os
+import sys
+import subprocess
+import time
+import re
+
+# ========== 配置 ==========
+REMOTE_URL = "https://gitee.com/hky_gitee/data_deel"
+REMOTE_NAME = "origin"
+BRANCH = "master"
+
+# ========== 工具函数 ==========
+def run_cmd(cmd, capture=True, check=False, shell=True):
+    try:
+        if capture:
+            result = subprocess.run(cmd, shell=shell, capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace', check=check)
+            return result.returncode, result.stdout.strip(), result.stderr.strip()
+        else:
+            result = subprocess.run(cmd, shell=shell, check=check)
+            return result.returncode, "", ""
+    except subprocess.CalledProcessError as e:
+        return e.returncode, e.stdout.strip() if e.stdout else "", e.stderr.strip() if e.stderr else str(e)
+
+def force_delete_git():
+    """强制删除 .git 目录，自动重试"""
+    if not os.path.exists('.git'):
+        print("没有 .git 目录，跳过删除。")
+        return True
+
+    print("正在强制删除 .git 目录...")
+    for attempt in range(1, 4):
+        ret, _, err = run_cmd('rmdir /s /q .git', capture=True)
+        if ret == 0 or not os.path.exists('.git'):
+            print(f"✓ 删除成功（尝试 {attempt}）")
+            return True
+        print(f"删除失败（尝试 {attempt}），等待 2 秒...")
+        time.sleep(2)
+        # 备用命令
+        ret, _, err = run_cmd('rd /s /q .git', capture=True)
+        if ret == 0 or not os.path.exists('.git'):
+            print(f"✓ 删除成功（尝试 {attempt} 使用 rd）")
+            return True
+        time.sleep(2)
+
+    print("❌ 无法删除 .git 目录，请手动关闭占用程序后重试。")
+    return False
+
+def create_gitignore():
+    """创建完善的 .gitignore"""
+    content = """# === 可执行文件 ===
+*.exe
+*.msi
+
+# === Excel 文件（所有格式） ===
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*.xltx
+*.xltm
+
+# === 大文件（防止超限） ===
+*.zip
+*.tar.gz
+*.7z
+*.rar
+*.iso
+*.bin
+*.dat
+*.pkl
+*.joblib
+*.parquet
+*.feather
+*.pth
+*.ckpt
+*.pb
+*.onnx
+*.h5
+*.npy
+
+# === 临时文件 ===
+*.tmp
+*.bak
+*.log
+*.cache
+*.pyc
+__pycache__/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# === 虚拟环境 ===
+.venv/
+venv/
+ENV/
+env/
+
+# === 项目特定 ===
+Excel/
+*.ipynb_checkpoints/
+
+# === 其他可能的大文件 ===
+*.pdf
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.mp3
+*.wav
+
+# === 压缩备份 ===
+*.backup
+*.old
+"""
+    with open(".gitignore", "w", encoding="utf-8") as f:
+        f.write(content)
+    print("✓ .gitignore 已创建/覆盖")
+
+def has_chinese(text):
+    """判断字符串是否包含中文"""
+    return bool(re.search(r'[\u4e00-\u9fff]', text))
+
+def remove_chinese_items_from_index():
+    """
+    从 Git 索引中移除所有文件名包含中文的文件，以及目录名包含中文的目录（递归）
+    本地文件不受影响
+    """
+    # 获取当前暂存区所有文件（包括已添加的）
+    ret, files, err = run_cmd("git ls-files --cached")
+    if ret != 0:
+        print("无法获取暂存区文件列表")
+        return
+
+    chinese_files = []
+    chinese_dirs = set()
+
+    for f in files.splitlines():
+        f = f.strip()
+        if not f:
+            continue
+        # 检查文件名（不含路径）是否含中文
+        basename = os.path.basename(f)
+        if has_chinese(basename):
+            chinese_files.append(f)
+            continue
+        # 检查路径中的每一级目录是否含中文
+        parts = f.split('/')
+        for i in range(len(parts)-1):  # 目录部分
+            if has_chinese(parts[i]):
+                # 标记该目录前缀
+                prefix = '/'.join(parts[:i+1])
+                chinese_dirs.add(prefix)
+                break
+
+    if chinese_files:
+        print(f"发现 {len(chinese_files)} 个文件名含中文的文件，正在从索引移除...")
+        for f in chinese_files:
+            run_cmd(f'git rm --cached --ignore-unmatch "{f}"', capture=False, check=False)
+        print("✓ 已移除中文名文件")
+
+    if chinese_dirs:
+        print(f"发现 {len(chinese_dirs)} 个目录名含中文的目录，正在递归移除...")
+        for d in chinese_dirs:
+            run_cmd(f'git rm -r --cached --ignore-unmatch "{d}/"', capture=False, check=False)
+        print("✓ 已移除中文目录下的所有内容")
+
+def main():
+    print("=" * 60)
+    print("强制重建 Git 仓库并推送到 Gitee")
+    print("目标仓库:", REMOTE_URL)
+    print("=" * 60)
+    print("注意：此操作将删除所有 Git 历史记录，仅保留当前文件内容。")
+    confirm = input("是否继续？(y/N): ").strip().lower()
+    if confirm != 'y':
+        print("已取消")
+        sys.exit(0)
+
+    # 1. 删除 .git
+    if not force_delete_git():
+        sys.exit(1)
+
+    # 2. 初始化
+    print("\n初始化新仓库...")
+    run_cmd("git init", capture=False)
+
+    # 3. 创建 .gitignore
+    create_gitignore()
+
+    # 4. 添加所有文件（此时 .gitignore 会生效）
+    print("\n添加文件到暂存区（.gitignore 自动生效）...")
+    run_cmd("git add .", capture=False)
+
+    # 5. 移除中文名文件/目录（从暂存区）
+    print("\n检查并移除中文名文件/目录...")
+    remove_chinese_items_from_index()
+
+    # 6. 检查是否有需要提交的内容
+    ret, status, _ = run_cmd("git status --porcelain")
+    if ret != 0 or not status:
+        print("\n⚠️ 没有需要提交的文件！请检查 .gitignore 规则或项目目录是否为空。")
+        sys.exit(1)
+
+    # 7. 提交
+    commit_msg = input("\n请输入提交信息（直接回车使用默认）: ").strip()
+    if not commit_msg:
+        commit_msg = "Initial commit: clean project without ignored files"
+    ret, _, err = run_cmd(f'git commit -m "{commit_msg}"')
+    if ret != 0:
+        print("提交失败:", err)
+        sys.exit(1)
+    print("✓ 提交成功")
+
+    # 8. 配置远程
+    print(f"\n配置远程仓库 {REMOTE_NAME} -> {REMOTE_URL}")
+    ret, _, _ = run_cmd(f"git remote get-url {REMOTE_NAME}", capture=True, check=False)
+    if ret == 0:
+        run_cmd(f"git remote set-url {REMOTE_NAME} {REMOTE_URL}", capture=False)
+        print("已更新 origin URL")
+    else:
+        run_cmd(f"git remote add {REMOTE_NAME} {REMOTE_URL}", capture=False)
+        print("已添加远程仓库")
+
+    # 9. 强制推送
+    print(f"\n准备强制推送到 {REMOTE_NAME}/{BRANCH}...")
+    final = input("是否执行强制推送？(y/N): ").strip().lower()
+    if final != 'y':
+        print("已取消推送，本地仓库已重建但未推送。")
+        sys.exit(0)
+
+    ret, _, err = run_cmd(f"git push -u {REMOTE_NAME} {BRANCH} --force")
+    if ret != 0:
+        print("推送失败:", err)
+        sys.exit(1)
+
+    print("\n🎉 推送成功！远程仓库已更新，历史已清空。")
+
+if __name__ == "__main__":
+    main()
+```
+
 ## install_requirements.py
 
 ```python
@@ -3337,6 +3671,8 @@ waitress>=2.0.0
 Werkzeug>=2.0.0
 psutil>=5.9.0
 pydantic>=2.0.0
+pydantic-settings>=2.0.0
+dependency-injector>=4.41.0
 pytest>=7.4.0
 pytest-cov>=4.1.0
 ```
@@ -4474,478 +4810,6 @@ class DataWriter:
         except Exception as e:
             logger.error(f"写入带格式的 Excel 失败 {filepath}: {e}")
             raise
-```
-
-## services/excel/__init__.py
-
-```python
-"""Excel处理领域服务"""
-```
-
-## services/excel/aggregator.py
-
-```python
-# utils/common/aggregator.py
-import pandas as pd
-from typing import List, Dict, Any, Union, Optional
-
-class Aggregator:
-    """通用聚合器（静态方法）"""
-
-    @staticmethod
-    def group_aggregate(df: pd.DataFrame, group_keys: List[str],
-                        agg_spec: Dict[str, Union[str, List[str]]]) -> pd.DataFrame:
-        if not group_keys:
-            return df.drop_duplicates()
-        return df.groupby(group_keys, as_index=False).agg(agg_spec)
-
-    @staticmethod
-    def aggregate_by_keys(df: pd.DataFrame, unique_keys: List[str],
-                          sum_fields: List[str], other_fields: Optional[List[str]] = None) -> pd.DataFrame:
-        """
-        按唯一键聚合：sum_fields 求和，other_fields 取第一条记录。
-        不使用 groupby.agg 字典，改为组合 drop_duplicates 和 groupby sum，避免 pandas 内部错误。
-        """
-        if other_fields is None:
-            other_fields = [c for c in df.columns if c not in unique_keys and c not in sum_fields]
-        if not unique_keys:
-            return df.drop_duplicates()
-
-        # 1. 求和部分
-        if sum_fields:
-            sum_part = df.groupby(unique_keys, as_index=False)[sum_fields].sum()
-        else:
-            sum_part = pd.DataFrame(columns=unique_keys)  # 空框架，仅用于后续合并
-
-        # 2. 取第一条记录部分（直接用 drop_duplicates 保留第一个出现）
-        if other_fields:
-            first_part = df[unique_keys + other_fields].drop_duplicates(subset=unique_keys, keep='first')
-        else:
-            first_part = pd.DataFrame(columns=unique_keys)
-
-        # 3. 合并求和与首条记录
-        if not sum_part.empty and not first_part.empty:
-            result = sum_part.merge(first_part, on=unique_keys, how='outer')
-        elif not sum_part.empty:
-            result = sum_part
-        elif not first_part.empty:
-            result = first_part
-        else:
-            # 没有求和也没有其他字段时，直接去重返回唯一键
-            result = df[unique_keys].drop_duplicates()
-
-        return result
-
-    @staticmethod
-    def simple_aggregate(df: pd.DataFrame, group_keys: List[str],
-                         agg_cols: List[str], func: str = 'sum') -> pd.DataFrame:
-        agg_dict = {col: func for col in agg_cols}
-        return Aggregator.group_aggregate(df, group_keys, agg_dict)
-
-
-# 向后兼容包装
-class AggregateCalculator:
-    def __init__(self, excel_file):
-        self.excel_file = excel_file
-
-    def aggregate(self, group_cols, agg_cols, agg_func, result_col):
-        raise NotImplementedError
-```
-
-## services/excel/calculator.py
-
-```python
-# services/excel/calculator.py
-import numpy as np
-from typing import List, Tuple
-from openpyxl.utils import column_index_from_string
-from openpyxl.styles import Alignment
-from core.excel_utils import ExcelFile
-from core.expression_engine import get_expression_engine, extract_column_letters
-
-class ColumnCalculator:
-    def __init__(self, excel_file: ExcelFile):
-        self.excel = excel_file
-        self.ws = excel_file.active_sheet
-
-    def get_data_range(self, header_row: int = 1) -> Tuple[int, int]:
-        return header_row + 1, self.ws.max_row
-
-    def calculate_column(self, expression: str, result_col: str,
-                         merge_by_cols: List[str] = None) -> None:
-        engine = get_expression_engine()
-        col_letters = extract_column_letters(expression)
-        if not col_letters:
-            raise ValueError("表达式中未包含列字母")
-
-        try:
-            result_col_idx = column_index_from_string(result_col)
-            is_new_col = False
-        except:
-            is_new_col = True
-            result_col_name = result_col.strip()
-
-        if not is_new_col:
-            result_col_idx = column_index_from_string(result_col)
-        else:
-            max_col = self.ws.max_column
-            result_col_idx = max_col + 1
-            self.ws.insert_cols(result_col_idx)
-            self.ws.cell(1, result_col_idx).value = result_col_name
-
-        start_row, end_row = self.get_data_range()
-
-        col_data = {}
-        for col_letter in col_letters:
-            col_idx = column_index_from_string(col_letter)
-            vals = []
-            for row in range(start_row, end_row + 1):
-                val = self.excel.get_cell_value(row, col_idx, sheet=self.ws)
-                try:
-                    val = float(val) if val is not None else 0
-                except:
-                    val = 0
-                vals.append(val)
-            col_data[col_letter] = vals
-
-        calc_vals = []
-        first_letter = list(col_data.keys())[0]
-        for i in range(len(col_data[first_letter])):
-            row_vals = {letter: col_data[letter][i] for letter in col_letters}
-            result = engine.evaluate(expression, row_vals)
-            calc_vals.append(result)
-
-        self._clear_merges_in_column(result_col_idx)
-        for i, val in enumerate(calc_vals):
-            row = start_row + i
-            self.ws.cell(row, result_col_idx).value = None if np.isnan(val) else val
-
-        ref_col = sorted(col_letters)[0]
-        ref_idx = column_index_from_string(ref_col)
-        self.excel.copy_merge_structure(ref_idx, result_col_idx, start_row, end_row, sheet=self.ws)
-
-        if merge_by_cols:
-            self._merge_by_keys(merge_by_cols, result_col_idx, start_row, end_row)
-
-        for row in range(start_row, end_row + 1):
-            self.ws.cell(row, result_col_idx).alignment = Alignment(horizontal='right')
-
-    def _clear_merges_in_column(self, col_idx: int):
-        to_remove = []
-        for merged in self.ws.merged_cells.ranges:
-            if merged.min_col <= col_idx <= merged.max_col:
-                to_remove.append(merged)
-        for merged in to_remove:
-            self.ws.unmerge_cells(str(merged))
-
-    def _merge_by_keys(self, merge_cols, result_col_idx, start_row, end_row):
-        merge_indices = [column_index_from_string(c.strip()) for c in merge_cols]
-        group_first_row = {}
-        for row in range(start_row, end_row + 1):
-            key = tuple(self.excel.get_cell_value(row, col, sheet=self.ws) for col in merge_indices)
-            if key not in group_first_row:
-                group_first_row[key] = row
-
-        for row in range(start_row, end_row + 1):
-            key = tuple(self.excel.get_cell_value(row, col, sheet=self.ws) for col in merge_indices)
-            first_row = group_first_row.get(key)
-            if row != first_row:
-                self.ws.cell(row, result_col_idx).value = None
-
-        for key, first_row in group_first_row.items():
-            last_row = first_row
-            for row in range(first_row, end_row + 1):
-                if tuple(self.excel.get_cell_value(row, col, sheet=self.ws) for col in merge_indices) == key:
-                    last_row = row
-                else:
-                    break
-            if first_row < last_row:
-                self.ws.merge_cells(start_row=first_row, start_column=result_col_idx,
-                                    end_row=last_row, end_column=result_col_idx)
-```
-
-## services/excel/comparator.py
-
-```python
-# services/excel/comparator.py
-import pandas as pd
-import logging
-from typing import Dict, Any, Tuple, List, Optional
-
-logger = logging.getLogger(__name__)
-
-class ExcelComparator:
-    """Excel 文件对比核心类（业务服务）"""
-
-    @staticmethod
-    def _read_sheet(filepath: str, sheet: Optional[str]) -> pd.DataFrame:
-        if sheet is None or sheet == '':
-            return pd.read_excel(filepath, sheet_name=0)
-        try:
-            idx = int(sheet)
-            return pd.read_excel(filepath, sheet_name=idx)
-        except ValueError:
-            return pd.read_excel(filepath, sheet_name=sheet)
-
-    @classmethod
-    def full_compare(cls, file1: str, file2: str,
-                     key_fields: List[str], compare_fields: List[str],
-                     sheet1: Optional[str] = None, sheet2: Optional[str] = None) -> Dict[str, Any]:
-        df1 = cls._read_sheet(file1, sheet1)
-        df2 = cls._read_sheet(file2, sheet2)
-
-        cols1, cols2 = set(df1.columns), set(df2.columns)
-        missing_keys1 = [k for k in key_fields if k not in cols1]
-        missing_keys2 = [k for k in key_fields if k not in cols2]
-        if missing_keys1 or missing_keys2:
-            raise ValueError(f"主键字段不存在: {missing_keys1 + missing_keys2}")
-
-        missing_comp1 = [c for c in compare_fields if c not in cols1]
-        missing_comp2 = [c for c in compare_fields if c not in cols2]
-        if missing_comp1 or missing_comp2:
-            raise ValueError(f"对比字段不存在: {missing_comp1 + missing_comp2}")
-
-        if df1.duplicated(subset=key_fields).any():
-            raise ValueError("文件1中主键字段存在重复行")
-        if df2.duplicated(subset=key_fields).any():
-            raise ValueError("文件2中主键字段存在重复行")
-
-        df1.set_index(key_fields, inplace=True)
-        df2.set_index(key_fields, inplace=True)
-
-        df1_comp = df1[compare_fields] if set(compare_fields).issubset(df1.columns) else df1.reindex(columns=compare_fields)
-        df2_comp = df2[compare_fields] if set(compare_fields).issubset(df2.columns) else df2.reindex(columns=compare_fields)
-
-        only_in_1 = df1_comp.loc[~df1_comp.index.isin(df2_comp.index)]
-        only_in_2 = df2_comp.loc[~df2_comp.index.isin(df1_comp.index)]
-
-        common_keys = df1_comp.index.intersection(df2_comp.index)
-        diff_rows = []
-        for key in common_keys:
-            row1, row2 = df1_comp.loc[key], df2_comp.loc[key]
-            if not row1.equals(row2):
-                diff = {'主键': key}
-                for f in compare_fields:
-                    diff[f'文件1_{f}'] = row1[f]
-                    diff[f'文件2_{f}'] = row2[f]
-                    diff[f'{f}_是否一致'] = row1[f] == row2[f]
-                diff_rows.append(diff)
-
-        df_diff = pd.DataFrame(diff_rows) if diff_rows else None
-
-        if not only_in_1.empty:
-            only_in_1.reset_index(inplace=True)
-        if not only_in_2.empty:
-            only_in_2.reset_index(inplace=True)
-
-        return {'only_in_1': only_in_1, 'only_in_2': only_in_2, 'diff': df_diff}
-
-    @classmethod
-    def field_match(cls, file1: str, file2: str,
-                    match_field: str,
-                    sheet1: Optional[str] = None, sheet2: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        df1 = cls._read_sheet(file1, sheet1)
-        df2 = cls._read_sheet(file2, sheet2)
-        if match_field not in df1.columns:
-            raise ValueError(f"字段 '{match_field}' 在文件1中不存在")
-        if match_field not in df2.columns:
-            raise ValueError(f"字段 '{match_field}' 在文件2中不存在")
-        set1 = set(df1[match_field].astype(str).unique())
-        set2 = set(df2[match_field].astype(str).unique())
-        only_in_1 = set1 - set2
-        only_in_2 = set2 - set1
-        filtered_df1 = df1[df1[match_field].astype(str).isin(only_in_1)] if only_in_1 else pd.DataFrame()
-        filtered_df2 = df2[df2[match_field].astype(str).isin(only_in_2)] if only_in_2 else pd.DataFrame()
-        return filtered_df1, filtered_df2
-```
-
-## services/excel/compute_engine.py
-
-```python
-# services/excel/compute_engine.py
-import pandas as pd
-from typing import List, Dict, Any, Optional, Union
-from core.expression_engine import get_expression_engine
-from services.excel.aggregator import Aggregator
-
-class ComputeEngine:
-    @staticmethod
-    def evaluate_expression(expr: str, values: Dict[str, float]) -> float:
-        engine = get_expression_engine()
-        return engine.evaluate(expr, values)
-
-    @staticmethod
-    def extract_variables(expr: str) -> set:
-        import re
-        return set(re.findall(r'[A-Z]+', expr.upper()))
-
-    @staticmethod
-    def aggregate(df: pd.DataFrame, group_keys: List[str],
-                  agg_spec: Dict[str, Union[str, List[str]]]) -> pd.DataFrame:
-        return Aggregator.group_aggregate(df, group_keys, agg_spec)
-
-    @staticmethod
-    def simple_aggregate(df: pd.DataFrame, group_keys: List[str],
-                         agg_cols: List[str], func: str = 'sum') -> pd.DataFrame:
-        return Aggregator.simple_aggregate(df, group_keys, agg_cols, func)
-
-    @staticmethod
-    def aggregate_by_keys(df: pd.DataFrame, unique_keys: List[str],
-                          sum_fields: List[str], other_fields: Optional[List[str]] = None) -> pd.DataFrame:
-        return Aggregator.aggregate_by_keys(df, unique_keys, sum_fields, other_fields)
-```
-
-## services/excel/excel_service.py
-
-```python
-# services/excel/excel_service.py
-import openpyxl
-from openpyxl.utils import column_index_from_string
-from copy import copy
-import logging
-from typing import Union, List, Optional
-
-from core.excel_utils import col_letter_to_index, col_index_to_letter, copy_merge_structure
-
-logger = logging.getLogger(__name__)
-
-class ExcelService:
-    @staticmethod
-    def copy_cell_style(src_cell, dst_cell):
-        if src_cell.has_style:
-            dst_cell.font = copy(src_cell.font)
-            dst_cell.border = copy(src_cell.border)
-            dst_cell.fill = copy(src_cell.fill)
-            dst_cell.number_format = src_cell.number_format
-            dst_cell.alignment = copy(src_cell.alignment)
-            dst_cell.protection = copy(src_cell.protection)
-        dst_cell.value = src_cell.value
-
-    @staticmethod
-    def copy_merge_structure(ws, src_col: Union[int, str], dst_col: Union[int, str],
-                             start_row: int, end_row: int):
-        # 直接调用核心函数
-        copy_merge_structure(ws, src_col, ws, dst_col, start_row, end_row)
-
-    @staticmethod
-    def get_cell_value(ws, row: int, col: Union[int, str]) -> any:
-        if isinstance(col, str):
-            col = col_letter_to_index(col)
-        cell = ws.cell(row, col)
-        for merged in ws.merged_cells.ranges:
-            if cell.coordinate in merged:
-                return ws.cell(merged.min_row, merged.min_col).value
-        return cell.value
-```
-
-## services/excel/filter.py
-
-```python
-# services/excel/filter.py
-import pandas as pd
-import logging
-from typing import List, Tuple, Optional
-from utils.condition_filter import ConditionFilter, Condition
-
-logger = logging.getLogger(__name__)
-
-class ExcelFilter:
-    """Excel 数据筛选核心类"""
-
-    @staticmethod
-    def apply_filters(df: pd.DataFrame, conditions: List[Tuple[str, List[str]]],
-                      fuzzy_field: Optional[str] = None, fuzzy_value: Optional[str] = None) -> pd.DataFrame:
-        mask = pd.Series([True] * len(df))
-
-        for field, values in conditions:
-            if not values:
-                continue
-            if len(values) == 1:
-                cond = Condition(field=field, op='=', value=values[0], exclude=False)
-                part_mask = ConditionFilter.apply_to_dataframe(df, [cond])
-            else:
-                part_mask = df[field].astype(str).isin(values)
-            mask &= part_mask
-
-        if fuzzy_field and fuzzy_value:
-            cond = Condition(field=fuzzy_field, op='contains', value=fuzzy_value, exclude=False)
-            mask &= ConditionFilter.apply_to_dataframe(df, [cond])
-
-        return df[mask]
-
-    @staticmethod
-    def read_and_combine(file_paths: List[str]) -> pd.DataFrame:
-        """读取多个 Excel 文件并合并为单个 DataFrame"""
-        from core.excel_utils import ExcelFile   # 修正导入路径
-        dfs = []
-        for path in file_paths:
-            df = ExcelFile.read_dataframe(path)
-            dfs.append(df)
-        if not dfs:
-            raise ValueError("没有成功读取任何文件")
-        return pd.concat(dfs, ignore_index=True)
-
-    @staticmethod
-    def round_numeric_columns(df: pd.DataFrame, decimals: int = 2) -> pd.DataFrame:
-        df = df.copy()
-        for col in df.columns:
-            numeric_series = pd.to_numeric(df[col], errors='coerce')
-            if numeric_series.notna().any():
-                df[col] = numeric_series.apply(lambda x: round(x, decimals) if pd.notnull(x) else x)
-        return df
-```
-
-## services/excel/filter_engine.py
-
-```python
-# services/excel/filter_engine.py
-"""向后兼容的筛选引擎，委托给 core.filter_engine"""
-import pandas as pd
-from typing import List, Tuple, Optional
-from core.filter_engine import ConditionEngine
-from utils.condition_filter import Condition
-
-class FilterEngine:
-    @staticmethod
-    def filter_dataframe(df: pd.DataFrame, conditions: List[Condition]) -> pd.DataFrame:
-        engine = ConditionEngine()
-        exact, fuzzy = [], []
-        for c in conditions:
-            op = c.op
-            if op in ('contains', '包含'): op = '包含'
-            elif op in ('not_contains', '不包含'): op = '不包含'
-            if op in ('包含', '不包含'):
-                fuzzy.append({'field': c.field, 'op': op, 'value': str(c.value)})
-            else:
-                exact.append({'field': c.field, 'op': op, 'values': [str(c.value)]})
-        return engine.apply_to_dataframe(df, exact, fuzzy)
-
-    @staticmethod
-    def filter_dataframe_with_multi_values(df: pd.DataFrame,
-                                           exact_conditions: List[Tuple[str, List[str]]],
-                                           fuzzy_conditions: Optional[List[Tuple[str, str]]] = None) -> pd.DataFrame:
-        engine = ConditionEngine()
-        exact = [{'field': f, 'op': '=', 'values': vs} for f, vs in exact_conditions]
-        fuzzy = [{'field': f, 'op': '包含', 'value': v} for f, v in (fuzzy_conditions or [])]
-        return engine.apply_to_dataframe(df, exact, fuzzy)
-
-    @staticmethod
-    def filter_dict(row: dict, conditions: List[Condition]) -> bool:
-        engine = ConditionEngine()
-        exact, fuzzy = [], []
-        for c in conditions:
-            op = c.op
-            if op in ('contains', '包含'): op = '包含'
-            elif op in ('not_contains', '不包含'): op = '不包含'
-            if op in ('包含', '不包含'):
-                fuzzy.append({'field': c.field, 'op': op, 'value': str(c.value)})
-            else:
-                exact.append({'field': c.field, 'op': op, 'values': [str(c.value)]})
-        return engine.apply_to_row(row, exact, fuzzy)
-
-    @staticmethod
-    def create_condition(field: str, op: str, value, exclude: bool = False) -> Condition:
-        return Condition(field=field, op=op, value=value, exclude=exclude)
 ```
 
 ## services/field_parser/__init__.py
@@ -6584,6 +6448,108 @@ class TeamReportExcelWriter:
         return output_path
 ```
 
+## services/transposer/service.py
+
+```python
+# services/transposer/service.py
+import pandas as pd
+from typing import List, Optional
+
+
+def pivot_table(df: pd.DataFrame,
+                index_cols: Optional[List[str]],
+                category_col: str,
+                value_cols: List[str]) -> pd.DataFrame:
+    """
+    将分类列的值转置为新的列名，同时保留其他固定列。
+
+    :param df: 原始数据
+    :param index_cols: 索引列列表；若为空则自动生成组内序号（此时固定列不会被保留）
+    :param category_col: 分类列名（如“医疗类别”）
+    :param value_cols: 值列名列表（如“a数据”，“b数据”）
+    :return: 转置后的 DataFrame，固定列在左侧，拼接后的新值列严格按“类别+值列名”排列（无空格）
+    """
+    df = df.copy()
+
+    # 如果未提供索引列，自动生成组内序号，并在此情况下不保留固定列
+    auto_index = False
+    if not index_cols:
+        df['_idx'] = df.groupby(category_col).cumcount()
+        index_cols = ['_idx']
+        auto_index = True
+
+    # 区分固定列：所有列 - category_col - value_cols
+    # 注意：value_cols 中可能包含已被选为索引的列，但用户应避免错误输入
+    other_cols = [c for c in df.columns 
+                  if c not in value_cols and c != category_col]
+
+    # 如果使用自动序号，则不保留任何固定列（因为固定列与自动序号没有实际关联）
+    if auto_index:
+        other_cols = []
+    else:
+        # 确保索引列被包含在 other_cols 中（通常已包含）
+        # 并去除重复
+        other_cols = list(dict.fromkeys(other_cols))
+
+    # 取出固定列的唯一值（按 index_cols 去重）
+    if other_cols:
+        fixed_df = df[other_cols].drop_duplicates(subset=index_cols)
+        # 将固定列设置为索引以便后续合并
+        fixed_df = fixed_df.set_index(index_cols)
+    else:
+        fixed_df = pd.DataFrame()
+
+    # 执行 pivot：包括索引列、分类列、值列
+    pivot_input = df[index_cols + [category_col] + value_cols]
+    pivoted = pivot_input.pivot(index=index_cols, columns=category_col, values=value_cols)
+
+    # 扁平化多层列名并去除空格，连接方式为“类别+值列名”，不包含任何分隔符
+    new_columns = []
+    for col in pivoted.columns:
+        if isinstance(col, tuple):
+            # 元组顺序可能是 (value, category) 或 (category, value)，需要统一
+            # 通过检查 col 中哪个是 value_cols 中的列来确定顺序
+            cat, val = None, None
+            for part in col:
+                if part in value_cols:
+                    val = str(part).strip()
+                else:
+                    cat = str(part).strip()
+            if cat and val:
+                new_col = f"{cat}{val}"
+                new_columns.append(new_col)
+            else:
+                # 退化情况
+                new_columns.append(''.join(str(x).strip() for x in col))
+        else:
+            new_columns.append(str(col).strip())
+    pivoted.columns = new_columns
+
+    # 重置索引以便与固定列合并
+    pivoted.reset_index(inplace=True)
+    # 删除可能由自动索引添加的 '_idx' 列
+    if '_idx' in pivoted.columns:
+        pivoted.drop(columns=['_idx'], inplace=True)
+
+    # 合并固定列
+    if not fixed_df.empty:
+        # 将 pivoted 的索引列也设为索引以执行合并
+        pivoted_merge = pivoted.set_index(index_cols)
+        result = fixed_df.join(pivoted_merge, how='right')
+        result.reset_index(inplace=True)
+    else:
+        result = pivoted
+
+    # 重新排序列：固定列（other_cols 中出现在 result 中的列）→ 新的值列
+    fixed_cols_in_result = [c for c in other_cols if c in result.columns]
+    new_value_cols = [c for c in result.columns if c not in fixed_cols_in_result]
+    result = result[fixed_cols_in_result + new_value_cols]
+
+    # 对新的值列按“类别+值列名”排序（例如：门诊a数据、门诊b数据、住院a数据、住院b数据、其他a数据、其他b数据）
+    # 此处保持原顺序，仅确保无空白
+    return result
+```
+
 ## static/css/checker.css
 
 ```css
@@ -7541,6 +7507,52 @@ document.addEventListener('DOMContentLoaded', () => {
 })();
 ```
 
+## static/js/transposer.js
+
+```javascript
+document.addEventListener('DOMContentLoaded', function() {
+    const form = document.getElementById('transposerForm');
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const statusArea = document.getElementById('statusArea');
+        const statusMsg = document.getElementById('statusMessage');
+        const submitBtn = document.getElementById('submitBtn');
+
+        statusArea.style.display = 'block';
+        statusMsg.textContent = '处理中，请稍候...';
+        submitBtn.disabled = true;
+
+        const formData = new FormData(form);
+        try {
+            const response = await fetch('/transposer/convert', {
+                method: 'POST',
+                body: formData
+            });
+            if (!response.ok) {
+                const errData = await response.json();
+                statusMsg.textContent = '错误：' + (errData.error || '未知错误');
+                submitBtn.disabled = false;
+                return;
+            }
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = '转置结果.xlsx';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+            statusMsg.textContent = '转换成功，文件已下载。';
+        } catch (err) {
+            statusMsg.textContent = '网络错误：' + err.message;
+        } finally {
+            submitBtn.disabled = false;
+        }
+    });
+});
+```
+
 ## static/style.css
 
 ```css
@@ -7615,38 +7627,6 @@ label {
 }
 ```
 
-## task_status_test/e92bfcad-4a7d-49c8-ba34-c5d1e9133df7.json
-
-```json
-{
-  "task_id": "e92bfcad-4a7d-49c8-ba34-c5d1e9133df7",
-  "status": "completed",
-  "created_at": "2026-04-29T09:17:54.426838",
-  "started_at": "2026-04-29T09:17:54.427367",
-  "completed_at": "2026-04-29T09:17:54.506068",
-  "result_path": "D:\\creator\\project\\uploads\\simplify_test\\header等2个文件（精简版）.xlsx",
-  "result_format": "xlsx",
-  "error": null,
-  "total_input_rows": 3,
-  "total_output_rows": 2,
-  "params": {
-    "key_cols": [
-      "id"
-    ],
-    "keep_cols": [
-      "value"
-    ],
-    "non_sum_fields": [
-      "name"
-    ],
-    "filters": [],
-    "output_format": "xlsx",
-    "column_mode": "name"
-  },
-  "original_filename": "header"
-}
-```
-
 ## templates/base.html
 
 ```html
@@ -7676,7 +7656,8 @@ label {
                 <li><a href="{{ url_for('field_parser.index') }}">🔗 字段映射</a></li>
                 <li><a href="{{ url_for('checker.index') }}">✅ 文件校验</a></li>
                 <li><a href="{{ url_for('convert.index') }}">🔄 格式转换</a>
-                <li><a href="{{ url_for('team_report.index') }}">📊 车队日报</a></li></li>
+                <li><a href="{{ url_for('team_report.index') }}">📊 车队日报</a></li>
+                <li><a href="{{ url_for('transposer.index') }}">🔄 行列转置</a></li></li>
             </ul>
         </nav>
         {% block content %}{% endblock %}
@@ -8796,6 +8777,50 @@ label {
 {% endblock %}
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/team_report.js') }}"></script>
+{% endblock %}
+```
+
+## templates/transposer/index.html
+
+```html
+{% extends "base.html" %}
+{% block title %}行列转置{% endblock %}
+{% block content %}
+<h2>🔄 行列转置（取消分类列）</h2>
+<p>将某一分类列的不同取值转换为列标题，实现长表转宽表。例如：医疗类别（住院、门诊、其他）变为列头，原数值列变为“住院a数据”、“门诊b数据”等。</p>
+
+<form id="transposerForm" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📁 上传 Excel 文件</label>
+            <input type="file" name="file" accept=".xlsx,.xls" required>
+        </div>
+    </div>
+    <div class="form-section">
+        <div class="form-row">
+            <label>🔑 索引列（主键，多列用逗号或空格分隔，可选）</label>
+            <input type="text" name="index_cols" placeholder="例如 病种名称 单位名称，或 A B">
+            <div class="hint">若不填，将自动为每组类别生成行序号，并以此为索引。</div>
+        </div>
+        <div class="form-row">
+            <label>📋 分类列（将被取消的列）</label>
+            <input type="text" name="category_col" placeholder="例如 医疗类别" required>
+        </div>
+        <div class="form-row">
+            <label>📊 值列（需保留的数值列，多选）</label>
+            <input type="text" name="value_cols" placeholder="例如 a数据 b数据" required>
+            <div class="hint">多个列名用逗号或空格分隔。</div>
+        </div>
+    </div>
+    <button type="submit" class="btn btn-success" id="submitBtn">开始转换</button>
+</form>
+
+<div id="statusArea" class="status-area" style="display:none;">
+    <p id="statusMessage"></p>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/transposer.js') }}"></script>
 {% endblock %}
 ```
 
@@ -11113,4 +11138,4 @@ from core.validators import (
 ```
 
 
-> ✅ 共导出 141 个代码文件。
+> ✅ 共导出 137 个代码文件。

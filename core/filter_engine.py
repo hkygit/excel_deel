@@ -186,3 +186,115 @@ class ConditionEngine:
 
 # 全局默认引擎实例
 default_engine = ConditionEngine()
+
+
+# ========== 以下为兼容废弃模块而添加的类，直接委托给本模块实现 ==========
+
+class Condition:
+    """条件数据类（兼容 utils.condition_filter.Condition）"""
+    def __init__(self, field, op, value, exclude=False):
+        self.field = field
+        self.op = op
+        self.value = value
+        self.exclude = exclude
+
+
+class ConditionFilter:
+    """条件过滤器（兼容 utils.condition_filter.ConditionFilter）"""
+    @staticmethod
+    def apply_to_dict(row, conditions):
+        from core.filter_engine import ConditionEngine
+        engine = ConditionEngine()
+        for c in conditions:
+            if isinstance(c, Condition):
+                op = c.op
+                if op in ('contains', '包含'):
+                    op = '包含'
+                elif op in ('not_contains', '不包含'):
+                    op = '不包含'
+                if op in ('包含', '不包含'):
+                    fuzzy = [{'field': c.field, 'op': op, 'value': str(c.value)}]
+                    exact = []
+                else:
+                    exact = [{'field': c.field, 'op': op, 'values': [str(c.value)]}]
+                    fuzzy = []
+                result = engine.apply_to_row(row, exact, fuzzy)
+                if c.exclude:
+                    result = not result
+                if not result:
+                    return False
+        return True
+
+    @staticmethod
+    def apply_to_dataframe(df, conditions):
+        mask = pd.Series(True, index=df.index)
+        engine = ConditionEngine()
+        for c in conditions:
+            if isinstance(c, Condition):
+                op = c.op
+                if op in ('contains', '包含'):
+                    op = '包含'
+                elif op in ('not_contains', '不包含'):
+                    op = '不包含'
+                if op in ('包含', '不包含'):
+                    fuzzy = [{'field': c.field, 'op': op, 'value': str(c.value)}]
+                    exact = []
+                else:
+                    exact = [{'field': c.field, 'op': op, 'values': [str(c.value)]}]
+                    fuzzy = []
+                filtered = engine.apply_to_dataframe(df, exact, fuzzy)
+                cond_mask = pd.Series(False, index=df.index)
+                cond_mask[filtered.index] = True
+                if c.exclude:
+                    cond_mask = ~cond_mask
+                mask &= cond_mask
+        return mask
+
+
+class FilterEngine:
+    """Excel 筛选引擎（兼容 services.excel.filter_engine.FilterEngine）"""
+    @staticmethod
+    def filter_dataframe(df, conditions):
+        from core.filter_engine import ConditionEngine
+        engine = ConditionEngine()
+        exact, fuzzy = [], []
+        for c in conditions:
+            op = c.op
+            if op in ('contains', '包含'):
+                op = '包含'
+            elif op in ('not_contains', '不包含'):
+                op = '不包含'
+            if op in ('包含', '不包含'):
+                fuzzy.append({'field': c.field, 'op': op, 'value': str(c.value)})
+            else:
+                exact.append({'field': c.field, 'op': op, 'values': [str(c.value)]})
+        return engine.apply_to_dataframe(df, exact, fuzzy)
+
+    @staticmethod
+    def filter_dataframe_with_multi_values(df, exact_conditions, fuzzy_conditions=None):
+        from core.filter_engine import ConditionEngine
+        engine = ConditionEngine()
+        exact = [{'field': f, 'op': '=', 'values': vs} for f, vs in exact_conditions]
+        fuzzy = [{'field': f, 'op': '包含', 'value': v} for f, v in (fuzzy_conditions or [])]
+        return engine.apply_to_dataframe(df, exact, fuzzy)
+
+    @staticmethod
+    def filter_dict(row, conditions):
+        from core.filter_engine import ConditionEngine
+        engine = ConditionEngine()
+        exact, fuzzy = [], []
+        for c in conditions:
+            op = c.op
+            if op in ('contains', '包含'):
+                op = '包含'
+            elif op in ('not_contains', '不包含'):
+                op = '不包含'
+            if op in ('包含', '不包含'):
+                fuzzy.append({'field': c.field, 'op': op, 'value': str(c.value)})
+            else:
+                exact.append({'field': c.field, 'op': op, 'values': [str(c.value)]})
+        return engine.apply_to_row(row, exact, fuzzy)
+
+    @staticmethod
+    def create_condition(field, op, value, exclude=False):
+        return Condition(field=field, op=op, value=value, exclude=exclude)

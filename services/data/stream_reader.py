@@ -1,6 +1,6 @@
 import os, logging, csv
 from typing import List, Optional, Callable, Generator, Dict, Any
-from utils.condition_filter import ConditionFilter, Condition
+from core.filter_engine import ConditionFilter, Condition
 
 logger = logging.getLogger(__name__)
 

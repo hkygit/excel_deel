@@ -4,7 +4,7 @@ from services.data.writer import DataWriter
 from services.data.formatter import DataFormatter
 from services.data.file_service import FileService
 from services.excel.compute_engine import ComputeEngine
-from services.excel.filter_engine import FilterEngine
+from core.filter_engine import FilterEngine
 from services.excel.aggregator import Aggregator
 
 __all__ = [
