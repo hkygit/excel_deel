@@ -1,0 +1,67 @@
+# === 可执行文件 ===
+*.exe
+*.msi
+
+# === Excel 文件（所有格式） ===
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*.xltx
+*.xltm
+
+# === 大文件（防止超限） ===
+*.zip
+*.tar.gz
+*.7z
+*.rar
+*.iso
+*.bin
+*.dat
+*.pkl
+*.joblib
+*.parquet
+*.feather
+*.pth
+*.ckpt
+*.pb
+*.onnx
+*.h5
+*.npy
+
+# === 临时文件 ===
+*.tmp
+*.bak
+*.log
+*.cache
+*.pyc
+__pycache__/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# === 虚拟环境 ===
+.venv/
+venv/
+ENV/
+env/
+
+# === 项目特定 ===
+Excel/
+*.ipynb_checkpoints/
+
+# === 其他可能的大文件 ===
+*.pdf
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.mp3
+*.wav
+
+# === 压缩备份 ===
+*.backup
+*.old

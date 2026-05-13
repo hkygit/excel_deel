@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}列计算 / 聚合回填{% endblock %}
+{% block content %}
+<h2>🧮 列计算 / 聚合回填</h2>
+<form action="{{ url_for('calc.process') }}" method="post" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📁 上传 Excel 文件</label>
+            <input type="file" name="file" accept=".xlsx,.xls" required>
+        </div>
+        <div class="form-row">
+            <label>⚙️ 操作类型</label>
+            <select name="calc_type" id="calcType">
+                <option value="column">列计算</option>
+                <option value="aggregate">聚合回填</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>表头所在行号（从1开始，默认1）</label>
+            <input type="number" name="header_row" value="1" min="1" style="max-width:100px;">
+            <div class="hint">如果你的 Excel 顶部有标题行，请填写实际列名所在的行号</div>
+        </div>
+    </div>
+    <div id="columnConfig" class="form-section">
+        <h3>📐 列计算设置</h3>
+        <div class="form-row">
+            <label>表达式 (如 A+B-C)</label>
+            <input type="text" name="expression" placeholder="例如 A+B">
+        </div>
+        <div class="form-row">
+            <label>结果列 (字母或新列名)</label>
+            <input type="text" name="result_col_column" placeholder="K 或 '差值'">
+        </div>
+        <div class="form-row">
+            <label>合并依据列 (可选，逗号分隔)</label>
+            <input type="text" name="merge_by_cols" placeholder="A,B">
+            <div class="hint">相同组的结果列只保留第一行，其余合并。</div>
+        </div>
+    </div>
+    <div id="aggregateConfig" class="form-section" style="display:none;">
+        <h3>📊 聚合回填设置</h3>
+        <div class="form-row">
+            <label>分组列 (逗号分隔，支持列名或列字母)</label>
+            <input type="text" name="group_cols" placeholder="A,B">
+        </div>
+        <div class="form-row">
+            <label>聚合列 (逗号分隔)</label>
+            <input type="text" name="agg_cols" placeholder="C,D">
+        </div>
+        <div class="form-row">
+            <label>聚合函数</label>
+            <select name="agg_func">
+                <option value="sum">求和</option>
+                <option value="mean">平均值</option>
+                <option value="max">最大值</option>
+                <option value="min">最小值</option>
+                <option value="count">计数</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>结果列名</label>
+            <input type="text" name="result_col_aggregate" placeholder="K 或 '聚合结果'">
+        </div>
+    </div>
+    <button type="submit" class="btn btn-success">开始处理</button>
+</form>
+<script>
+    const typeSelect = document.getElementById('calcType');
+    const colCfg = document.getElementById('columnConfig');
+    const aggCfg = document.getElementById('aggregateConfig');
+    function toggle() {
+        if (typeSelect.value === 'column') {
+            colCfg.style.display = 'block';
+            aggCfg.style.display = 'none';
+        } else {
+            colCfg.style.display = 'none';
+            aggCfg.style.display = 'block';
+        }
+    }
+    typeSelect.addEventListener('change', toggle);
+    toggle();
+</script>
+{% endblock %}

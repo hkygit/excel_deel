@@ -1,0 +1,69 @@
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0;
+    padding: 20px;
+    background: #f5f7fa;
+}
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    background: white;
+    padding: 30px;
+    border-radius: 12px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+nav ul {
+    list-style: none;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 20px;
+    margin-bottom: 30px;
+}
+nav a {
+    text-decoration: none;
+    color: #007bff;
+    font-weight: 500;
+}
+nav a:hover {
+    text-decoration: underline;
+}
+.message {
+    margin-top: 20px;
+    padding: 12px;
+    border-radius: 6px;
+}
+.message.error {
+    background: #fee;
+    color: #c00;
+}
+.message.success {
+    background: #efe;
+    color: #060;
+}
+button, .btn {
+    background: #007bff;
+    color: white;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 16px;
+}
+button:hover, .btn:hover {
+    background: #0056b3;
+}
+input, select, textarea {
+    padding: 8px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    width: 100%;
+    max-width: 400px;
+    margin-bottom: 15px;
+}
+label {
+    font-weight: 600;
+    display: block;
+    margin-bottom: 5px;
+}

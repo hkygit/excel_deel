@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}文件校验{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/checker.css') }}">
+{% endblock %}
+{% block content %}
+<h2>✅ 文件校验</h2>
+<p>上传标准文件群和比较文件群，系统将根据您指定的主键和对比列进行比较，并生成差异报告。</p>
+
+<form id="checkerForm" enctype="multipart/form-data">
+    <div class="form-section">
+        <h3>📂 文件上传</h3>
+        <div class="form-row">
+            <label>标准文件群（可多选）</label>
+            <input type="file" id="filesA" name="files_a" accept=".xlsx,.xls,.csv" multiple required>
+        </div>
+        <div class="form-row">
+            <label>比较文件群（可多选）</label>
+            <input type="file" id="filesB" name="files_b" accept=".xlsx,.xls,.csv" multiple required>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>🔑 主键设置</h3>
+        <div class="form-row">
+            <label>标准群主键列（逗号或空格分隔）</label>
+            <input type="text" id="keyMapA" placeholder="例如 ID,日期">
+        </div>
+        <div class="form-row">
+            <label>比较群主键列（逗号或空格分隔，默认与标准相同）</label>
+            <input type="text" id="keyMapB" placeholder="留空则与标准群主键相同">
+        </div>
+        <div class="form-row">
+            <label>主键重复处理</label>
+            <select id="duplicateAction">
+                <option value="error" selected>报错</option>
+                <option value="keep_first">保留第一条</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>📊 对比列</h3>
+        <div class="parser-container" style="display: flex; gap: 20px;">
+            <div class="parser-box" style="flex: 1;">
+                <label>标准群对比列（每行一个或用逗号/空格分隔）</label>
+                <textarea id="compareStandardText" rows="5" placeholder="例如：医疗类别&#10;入院日期&#10;出院日期&#10;医疗费总额&#10;结算时间&#10;定点医药机构名称"></textarea>
+            </div>
+            <div class="parser-box" style="flex: 1;">
+                <label>比较群对比列（留空则与标准相同）</label>
+                <textarea id="compareCompareText" rows="5" placeholder="例如：医疗类别&#10;入院日期&#10;出院日期&#10;医疗费总额&#10;结算时间&#10;定点医疗机构名称"></textarea>
+            </div>
+        </div>
+        <div class="hint">按顺序一一对应，支持多列；比较群留空则默认与标准群列名相同。</div>
+    </div>
+
+    <div class="form-section">
+        <h3>🔍 标准群筛选（可选）</h3>
+        <div id="filtersContainer"></div>
+        <button type="button" class="btn btn-secondary" onclick="addFilter()">+ 添加筛选条件</button>
+        <div class="hint">支持多值OR：在“值”中用英文逗号分隔多个值</div>
+    </div>
+
+    <div style="text-align:center; margin: 30px 0;">
+        <button type="button" class="btn" id="btnPrecheck">🔎 预检</button>
+        <button type="button" class="btn btn-success" id="btnStart" disabled>▶ 开始校验</button>
+    </div>
+</form>
+
+<div id="statusArea" class="status-area" style="display:none;">
+    <h3>任务状态</h3>
+    <div class="progress"><div id="progressBar" class="progress-bar" style="width:0%"></div></div>
+    <p><strong>状态：</strong> <span id="taskStatus">等待中</span></p>
+    <p id="progressMessage" style="color:#666;"></p>
+    <div id="precheckResult" class="precheck-result"></div>
+    <div id="downloadLink" style="margin-top:15px;"></div>
+</div>
+
+<template id="filterRowTemplate">
+    <div class="filter-row">
+        <input type="text" name="filter_field" placeholder="字段名" class="filter-field">
+        <select name="filter_op" class="filter-op">
+            <option value="=">=</option><option value="!=">!=</option><option value=">">></option>
+            <option value="<"><</option><option value=">=">>=</option><option value="<="><=</option>
+            <option value="contains">包含</option><option value="not_contains">不包含</option>
+        </select>
+        <input type="text" name="filter_value" placeholder="值（多值用英文逗号）" class="filter-value">
+        <button type="button" class="btn btn-danger" onclick="this.parentElement.remove()">删除</button>
+    </div>
+</template>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/checker.js') }}"></script>
+{% endblock %}

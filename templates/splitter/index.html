@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% block title %}Excel拆分工具{% endblock %}
+{% block content %}
+<h2>✂️ Excel拆分工具（保留合并单元格）</h2>
+<p>根据指定列的唯一值将Excel拆分成多个文件，保留原格式。现在支持先筛选后拆分。</p>
+<form id="splitForm" method="POST" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📂 Excel文件</label>
+            <input type="file" name="file" accept=".xlsx,.xlsm,.xls" required>
+            <div class="hint">支持 .xlsx, .xlsm, .xls</div>
+        </div>
+        <div class="form-row">
+            <label>拆分列名</label>
+            <input type="text" name="split_column" placeholder="例如：险种类型" required>
+            <div class="hint">必须是第一行表头中的列名</div>
+        </div>
+        <div class="form-row">
+            <label>正选值（可选）</label>
+            <input type="text" name="include_values" placeholder="居民,职工">
+            <div class="hint">只拆分这些值</div>
+        </div>
+        <div class="form-row">
+            <label>反选值（可选）</label>
+            <input type="text" name="exclude_values" placeholder="其他">
+            <div class="hint">排除这些值</div>
+        </div>
+        <div class="form-row">
+            <label>跳过工作表索引</label>
+            <input type="text" name="skip_sheets" placeholder="1,3">
+            <div class="hint">不参与拆分的sheet序号（从1开始）</div>
+        </div>
+    </div>
+
+    <!-- 筛选条件区域 -->
+    <div class="form-section">
+        <h3>🎯 筛选条件（可选）</h3>
+        <div id="advancedConditions">
+            <div class="condition-row" style="display:flex; gap:8px; margin-bottom:10px;">
+                <input type="text" name="condition_field_0" placeholder="字段名" style="flex:2;">
+                <select name="condition_op_0" style="flex:1.5;">
+                    <option value="=">=</option>
+                    <option value="!=">!=</option>
+                    <option value=">">></option>
+                    <option value="<"><</option>
+                    <option value=">=">>=</option>
+                    <option value="<="><=</option>
+                    <option value="包含">包含</option>
+                    <option value="不包含">不包含</option>
+                </select>
+                <input type="text" name="condition_value_0" placeholder="值" style="flex:3;">
+                <button type="button" class="btn btn-danger" onclick="this.parentElement.remove()">✖</button>
+            </div>
+        </div>
+        <button type="button" class="btn btn-secondary" onclick="addCondition()">+ 添加条件</button>
+        <div class="hint">先按这些条件筛选数据，再进行拆分。所有条件为 AND 关系。</div>
+    </div>
+
+    <button type="submit" class="btn btn-success" id="submitBtn">开始拆分</button>
+</form>
+
+<div id="statusArea" class="status-area" style="display:none;">
+    <h3>处理状态</h3>
+    <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+    <p><strong>状态：</strong> <span id="taskStatus">处理中...</span></p>
+</div>
+<script>
+    let condCount = 1;
+    function addCondition() {
+        const container = document.getElementById('advancedConditions');
+        const div = document.createElement('div');
+        div.className = 'condition-row';
+        div.style.cssText = 'display:flex; gap:8px; margin-bottom:10px;';
+        div.innerHTML = `
+            <input type="text" name="condition_field_${condCount}" placeholder="字段名" style="flex:2;">
+            <select name="condition_op_${condCount}" style="flex:1.5;">
+                <option value="=">=</option>
+                <option value="!=">!=</option>
+                <option value=">">></option>
+                <option value="<"><</option>
+                <option value=">=">>=</option>
+                <option value="<="><=</option>
+                <option value="包含">包含</option>
+                <option value="不包含">不包含</option>
+            </select>
+            <input type="text" name="condition_value_${condCount}" placeholder="值" style="flex:3;">
+            <button type="button" class="btn btn-danger" onclick="this.parentElement.remove()">✖</button>
+        `;
+        container.appendChild(div);
+        condCount++;
+    }
+
+    const form = document.getElementById('splitForm');
+    const statusArea = document.getElementById('statusArea');
+    const taskStatus = document.getElementById('taskStatus');
+    const progressBar = document.getElementById('progressBar');
+    const submitBtn = document.getElementById('submitBtn');
+
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        statusArea.style.display = 'block';
+        taskStatus.innerText = '提交中...';
+        progressBar.style.width = '10%';
+        submitBtn.disabled = true;
+
+        const formData = new FormData(form);
+        try {
+            const response = await fetch('/splitter/process', {
+                method: 'POST',
+                body: formData
+            });
+            if (response.ok) {
+                const contentDisposition = response.headers.get('Content-Disposition');
+                let filename = '拆分结果.zip';
+                if (contentDisposition) {
+                    const match = contentDisposition.match(/filename="?(.+?)"?$/);
+                    if (match) filename = match[1];
+                }
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                taskStatus.innerText = '下载完成！';
+                progressBar.style.width = '100%';
+                progressBar.style.backgroundColor = '#28a745';
+                setTimeout(() => {
+                    statusArea.style.display = 'none';
+                }, 3000);
+            } else {
+                let errorMsg = '拆分失败';
+                try {
+                    const errData = await response.json();
+                    errorMsg = errData.message || errorMsg;
+                } catch (e) {
+                    errorMsg = `服务器错误 (${response.status})`;
+                }
+                taskStatus.innerText = '错误: ' + errorMsg;
+                progressBar.style.width = '100%';
+                progressBar.style.backgroundColor = '#dc3545';
+            }
+        } catch (err) {
+            taskStatus.innerText = '网络错误: ' + err.message;
+            progressBar.style.width = '100%';
+            progressBar.style.backgroundColor = '#dc3545';
+        } finally {
+            submitBtn.disabled = false;
+        }
+    });
+</script>
+{% endblock %}

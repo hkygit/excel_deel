@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}车队日报{% endblock %}
+{% block head %}
+<style>
+    .form-row { margin-bottom: 15px; }
+    .form-row label { display: block; margin-bottom: 5px; font-weight: bold; }
+    .form-row input[type="file"], .form-row input[type="text"], .form-row input[type="number"] { width: 100%; max-width: 300px; }
+    .hint { color: #666; font-size: 0.9em; }
+    .status-area { margin-top: 20px; }
+    .progress { height: 20px; background: #eee; border-radius: 10px; overflow: hidden; }
+    .progress-bar { height: 100%; background: #4361ee; width: 0%; transition: width 0.3s; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+</style>
+{% endblock %}
+{% block content %}
+<h2>📊 生成车队日报</h2>
+<form id="reportForm" enctype="multipart/form-data">
+    <div class="form-section">
+        <h3>📂 上传文件</h3>
+
+        <div class="form-row">
+            <label>今日司机流水文件 <span style="color:red;">*</span></label>
+            <input type="file" id="todayFile" name="today_file" accept=".xlsx,.xls,.csv" required>
+        </div>
+
+        <div class="form-row">
+            <label>昨日司机流水文件 （可选）</label>
+            <input type="file" id="yesterdayFile" name="yesterday_file" accept=".xlsx,.xls,.csv">
+        </div>
+
+        <div class="form-row">
+            <label>本月司机流水文件（可选，多选）</label>
+            <input type="file" id="monthlyFiles" name="monthly_files" accept=".xlsx,.xls,.csv" multiple>
+            <div class="hint">可上传多个月份的流水文件，用于统计月度累计数据</div>
+        </div>
+
+        <div class="form-row">
+            <label>队伍明细映射表 （可选）</label>
+            <input type="file" id="mappingFile" name="mapping_file" accept=".xlsx,.xls">
+            <div class="hint">若不提供，将使用已配置的默认映射</div>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>🎯 目标值设置（留空使用默认值）</h3>
+        <div class="grid-2">
+            <div class="form-row">
+                <label>日完单目标</label>
+                <input type="number" id="dailyOrderTarget" name="daily_order_target" placeholder="默认1150" min="1">
+            </div>
+            <div class="form-row">
+                <label>日报单目标</label>
+                <input type="number" id="dailyApplyTarget" name="daily_apply_target" placeholder="默认120" min="1">
+            </div>
+            <div class="form-row">
+                <label>月完单目标</label>
+                <input type="number" id="monthlyOrderTarget" name="monthly_order_target" placeholder="默认35650" min="1">
+            </div>
+            <div class="form-row">
+                <label>月报单目标</label>
+                <input type="number" id="monthlyApplyTarget" name="monthly_apply_target" placeholder="默认3720" min="1">
+            </div>
+        </div>
+    </div>
+
+    <button type="submit" class="btn btn-success" id="submitBtn">开始生成</button>
+</form>
+
+<div id="statusArea" class="status-area" style="display:none;">
+    <h3>任务状态</h3>
+    <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+    <p><strong>状态：</strong> <span id="taskStatus">等待中</span></p>
+    <p id="progressMessage"></p>
+    <div id="downloadLink" style="margin-top:15px;"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/team_report.js') }}"></script>
+{% endblock %}

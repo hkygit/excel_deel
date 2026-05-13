@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}首页 - Excel 工具集{% endblock %}
+{% block content %}
+<h2>👋 欢迎使用 Excel 智能工具集</h2>
+<p style="font-size: 1.1rem; margin-bottom: 32px;">请从导航栏选择所需功能：</p>
+
+<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 24px;">
+    <div class="form-section" style="margin:0;">
+        <h3 style="margin-top:0;">🧮 列计算/聚合回填</h3>
+        <p>支持多列表达式计算，或按分组聚合回填结果列，保留原有格式。</p>
+    </div>
+    <div class="form-section" style="margin:0;">
+        <h3 style="margin-top:0;">🔍 文件对比</h3>
+        <p>完整对比（主键匹配）或仅字段值匹配，输出差异报告。</p>
+    </div>
+    <div class="form-section" style="margin:0;">
+        <h3 style="margin-top:0;">⛃ 多条件筛选</h3>
+        <p>精确匹配 + 模糊查询，多文件合并筛选，支持导出Excel。</p>
+    </div>
+    <div class="form-section" style="margin:0;">
+        <h3 style="margin-top:0;">🔗 匹配填充</h3>
+        <p>根据源文件匹配目标文件，填充值并保留格式。</p>
+    </div>
+    <div class="form-section" style="margin:0;">
+        <h3 style="margin-top:0;">📋 汇总工具</h3>
+        <p>合并多个文件，按唯一键汇总求和。</p>
+    </div>
+    <div class="form-section" style="margin:0;">
+        <h3 style="margin-top:0;">⚡ 大文件精简</h3>
+        <p>超大CSV流式聚合，支持复杂筛选，自动输出Excel/CSV。</p>
+    </div>
+    <div class="form-section" style="margin:0;">
+        <h3 style="margin-top:0;">✂️ 文件拆分</h3>
+        <p>按列值拆分Excel为多个文件，保留合并单元格与样式。</p>
+    </div>
+</div>
+{% endblock %}

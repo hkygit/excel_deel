@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}文件对比{% endblock %}
+{% block content %}
+<h2>🔍 文件对比</h2>
+<form action="{{ url_for('compare.process') }}" method="post" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📂 文件 1</label>
+            <input type="file" name="file1" accept=".xlsx,.xls" required>
+            <input type="text" name="sheet1" placeholder="Sheet名称 (可选)" class="mt-2">
+        </div>
+        <div class="form-row">
+            <label>📂 文件 2</label>
+            <input type="file" name="file2" accept=".xlsx,.xls" required>
+            <input type="text" name="sheet2" placeholder="Sheet名称 (可选)" class="mt-2">
+        </div>
+        <div class="form-row">
+            <label>对比模式</label>
+            <select name="compare_mode" id="compareMode">
+                <option value="full">完整对比</option>
+                <option value="field_match">仅字段值匹配</option>
+            </select>
+        </div>
+    </div>
+    <div id="fullFields" class="form-section">
+        <div class="form-row">
+            <label>主键字段 (逗号分隔)</label>
+            <input type="text" name="key_fields" placeholder="学号,姓名">
+        </div>
+        <div class="form-row">
+            <label>对比字段 (逗号分隔)</label>
+            <input type="text" name="compare_fields" placeholder="学号,姓名,成绩">
+        </div>
+    </div>
+    <div id="fieldMatchOnly" class="form-section" style="display:none;">
+        <div class="form-row">
+            <label>匹配字段名</label>
+            <input type="text" name="match_field" placeholder="医疗机构名称">
+        </div>
+    </div>
+    <button type="submit" class="btn btn-success">开始对比</button>
+</form>
+<script>
+    const modeSelect = document.getElementById('compareMode');
+    const fullDiv = document.getElementById('fullFields');
+    const fieldDiv = document.getElementById('fieldMatchOnly');
+    modeSelect.addEventListener('change', () => {
+        if (modeSelect.value === 'full') {
+            fullDiv.style.display = 'block';
+            fieldDiv.style.display = 'none';
+        } else {
+            fullDiv.style.display = 'none';
+            fieldDiv.style.display = 'block';
+        }
+    });
+    modeSelect.dispatchEvent(new Event('change'));
+</script>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}匹配填充调试{% endblock %}
+{% block content %}
+<h2>🔍 匹配填充调试信息</h2>
+<div class="form-section">
+    <h3>配置</h3>
+    <pre>{{ config | tojson(indent=2) }}</pre>
+</div>
+<div class="form-section">
+    <h3>信息</h3>
+    <pre>{{ info | tojson(indent=2) }}</pre>
+</div>
+<a href="{{ url_for('match.index') }}" class="btn">返回</a>
+{% endblock %}

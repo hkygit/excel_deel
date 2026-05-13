@@ -1,0 +1,11 @@
+/* simplify 补充样式 (主要样式已在 style.css 中) */
+.filter-row {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 16px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.filter-field { width: 180px; }
+.filter-op { width: 120px; }
+.filter-value { width: 240px; }

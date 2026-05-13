@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}格式转换{% endblock %}
+{% block content %}
+<h2>🔄 文件格式转换</h2>
+<p>上传文件，选择目标格式和编码，开始转换。</p>
+<form id="convertForm" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📁 选择文件</label>
+            <input type="file" id="fileInput" name="file" accept=".xlsx,.xls,.xlsm,.csv" required>
+        </div>
+        <div class="form-row">
+            <label>目标格式</label>
+            <select id="targetFormat" name="target_format">
+                <option value="csv">CSV</option>
+                <option value="xlsx">Excel (.xlsx)</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>编码（仅CSV输出时有效）</label>
+            <select id="encoding" name="encoding">
+                <option value="utf-8-sig" selected>UTF-8 (带BOM)</option>
+                <option value="utf-8">UTF-8</option>
+                <option value="gbk">GBK</option>
+                <option value="gb2312">GB2312</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>分隔符（仅CSV输出时有效）</label>
+            <select id="separator" name="separator">
+                <option value="," selected>逗号 (,)</option>
+                <option value=";">分号 (;)</option>
+                <option value="	">制表符 (Tab)</option>
+            </select>
+        </div>
+    </div>
+    <button type="submit" class="btn btn-success" id="btnSubmit">开始转换</button>
+</form>
+<div id="statusArea" class="status-area" style="display:none;">
+    <h3>任务状态</h3>
+    <div class="progress"><div id="progressBar" class="progress-bar" style="width:0%"></div></div>
+    <p><strong>状态：</strong> <span id="taskStatus">等待中</span></p>
+    <p id="progressMessage"></p>
+    <div id="downloadLink" style="margin-top:15px;"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/convert.js') }}"></script>
+{% endblock %}

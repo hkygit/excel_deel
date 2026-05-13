@@ -1,0 +1,39 @@
+/* 文件校验模块样式 */
+.mapping-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
+.mapping-table th, .mapping-table td {
+    border: 1px solid #ddd;
+    padding: 8px;
+    text-align: left;
+}
+.compare-pair {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+.compare-pair input {
+    flex: 1;
+    max-width: 200px;
+}
+.compare-pair span {
+    font-weight: bold;
+    font-size: 1.2em;
+}
+.btn-remove-pair {
+    padding: 5px 10px;
+    background: #ef476f;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.precheck-result {
+    background: #f8f9fa;
+    padding: 10px;
+    border-radius: 8px;
+    margin: 10px 0;
+}

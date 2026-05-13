@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}汇总工具{% endblock %}
+{% block content %}
+<h2>📋 汇总工具</h2>
+<form action="{{ url_for('summary.process') }}" method="post" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📂 上传多个Excel文件</label>
+            <input type="file" name="files" accept=".xlsx,.xls" multiple required>
+        </div>
+        <div class="form-row">
+            <label>需要保留的字段（每行一个，或逗号/空格分隔）</label>
+            <textarea name="fields" rows="5" placeholder="机构名称&#10;日期&#10;金额" required></textarea>
+        </div>
+        <div class="form-row">
+            <label>唯一键（主键，逗号、换行或空格分隔，可选）</label>
+            <textarea name="unique_keys" rows="3" placeholder="例如 机构名称,日期"></textarea>
+        </div>
+        <div class="form-row">
+            <label>求和字段（逗号、换行或空格分隔，可选）</label>
+            <textarea name="sum_fields" rows="3" placeholder="例如 金额,数量"></textarea>
+        </div>
+        <div class="form-row">
+            <label>表头所在行号（从1开始，如有标题行请填写；留空则从第一行读取）</label>
+            <input type="number" name="header_row" value="" min="1" placeholder="例如 2" style="max-width:120px;">
+            <div class="hint">与下方“跳过标题行数”二选一，优先使用行号</div>
+        </div>
+        <div class="form-row">
+            <label>跳过的标题行数（第一行如果不是表头，请填写跳过行数）</label>
+            <input type="number" name="skip_header_rows" value="0" min="0" style="max-width:120px;">
+            <div class="hint">例如：文件第一行是标题，第二行是表头，则填写 1</div>
+        </div>
+    </div>
+    <button type="submit" class="btn btn-success">开始汇总</button>
+</form>
+{% endblock %}

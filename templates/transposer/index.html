@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}行列转置{% endblock %}
+{% block content %}
+<h2>🔄 行列转置（取消分类列）</h2>
+<p>将某一分类列的不同取值转换为列标题，实现长表转宽表。例如：医疗类别（住院、门诊、其他）变为列头，原数值列变为“住院a数据”、“门诊b数据”等。</p>
+
+<form id="transposerForm" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📁 上传 Excel 文件</label>
+            <input type="file" name="file" accept=".xlsx,.xls" required>
+        </div>
+    </div>
+    <div class="form-section">
+        <div class="form-row">
+            <label>🔑 索引列（主键，多列用逗号或空格分隔，可选）</label>
+            <input type="text" name="index_cols" placeholder="例如 病种名称 单位名称，或 A B">
+            <div class="hint">若不填，将自动为每组类别生成行序号，并以此为索引。</div>
+        </div>
+        <div class="form-row">
+            <label>📋 分类列（将被取消的列）</label>
+            <input type="text" name="category_col" placeholder="例如 医疗类别" required>
+        </div>
+        <div class="form-row">
+            <label>📊 值列（需保留的数值列，多选）</label>
+            <input type="text" name="value_cols" placeholder="例如 a数据 b数据" required>
+            <div class="hint">多个列名用逗号或空格分隔。</div>
+        </div>
+    </div>
+    <button type="submit" class="btn btn-success" id="submitBtn">开始转换</button>
+</form>
+
+<div id="statusArea" class="status-area" style="display:none;">
+    <p id="statusMessage"></p>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/transposer.js') }}"></script>
+{% endblock %}

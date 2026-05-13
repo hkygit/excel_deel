@@ -1,0 +1,80 @@
+
+import io
+import json
+import pandas as pd
+import pytest
+from unittest.mock import patch
+
+class TestCheckerIntegration:
+    def test_index_page(self, client):
+        response = client.get('/checker/')
+        assert response.status_code == 200
+        assert '文件校验' in response.get_data(as_text=True)
+
+    @pytest.fixture
+    def sample_files(self, tmp_path):
+        df_a1 = pd.DataFrame({"ID": [1, 2], "Name": ["Alice", "Bob"], "Score": [100, 90]})
+        df_a2 = pd.DataFrame({"ID": [3, 4], "Name": ["Charlie", "David"], "Score": [80, 70]})
+        df_b = pd.DataFrame({"ID": [1, 2, 5], "Name": ["Alice", "Bob", "Eve"], "Score": [100, 95, 60]})
+        return {'a1': df_a1, 'a2': df_a2, 'b': df_b}
+
+    def test_full_check_async(self, client, sample_files):
+        def df_to_bytes(df, filename):
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine='openpyxl') as w:
+                df.to_excel(w, index=False)
+            buf.seek(0)
+            return (buf, filename)
+
+        files_a = [df_to_bytes(sample_files['a1'], 'a1.xlsx'), df_to_bytes(sample_files['a2'], 'a2.xlsx')]
+        files_b = [df_to_bytes(sample_files['b'], 'b.xlsx')]
+
+        data = {
+            'key_map_a': 'ID',
+            'key_map_b': '',
+            'compare_map': json.dumps([{"standard": "Name", "compare": "Name"}, {"standard": "Score", "compare": "Score"}]),
+            'filters_a': '[]',
+            'duplicate_action': 'error',
+            'files_a': files_a,
+            'files_b': files_b,
+        }
+
+        # Mock TaskManager.start_task 使其同步执行目标函数
+        app = client.application
+        original_tm = app.container.task_manager()
+        def sync_start(task_id, target, args):
+            target(*args)  # 直接调用，不启动线程
+        with patch.object(original_tm, 'start_task', side_effect=sync_start):
+            response = client.post('/checker/process', data=data, content_type='multipart/form-data')
+            assert response.status_code == 200
+            result = response.get_json()
+            assert result['success'] == True  # 现在返回统一格式
+            task_id = result['data']['task_id']
+
+            # 任务应已同步完成，直接检查状态
+            status_resp = client.get(f'/checker/status/{task_id}')
+            status = status_resp.get_json()['data']
+            assert status['status'] == 'completed'
+
+            # 下载结果文件
+            download_resp = client.get(f'/checker/download/{task_id}')
+            assert download_resp.status_code == 200
+            result_df = pd.read_excel(io.BytesIO(download_resp.data), sheet_name=None)
+            assert '差异数据' in result_df
+            assert len(result_df['差异数据']) == 1
+            assert '标准群独有' in result_df
+            assert len(result_df['标准群独有']) == 2
+            assert '比较群独有' in result_df
+            assert len(result_df['比较群独有']) == 1
+
+    def test_missing_files_error(self, client):
+        response = client.post('/checker/process', data={})
+        assert response.status_code == 400
+        json_data = response.get_json()
+        assert not json_data['success']
+        assert '请上传两批文件' in json_data['error']
+
+    def test_invalid_task_status(self, client):
+        response = client.get('/checker/status/nonexistent')
+        assert response.status_code == 404
+        assert not response.get_json()['success']

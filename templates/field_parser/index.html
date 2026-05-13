@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}字段映射{% endblock %}
+{% block head %}
+<style>
+    .parser-container { display: flex; gap: 20px; margin-bottom: 20px; }
+    .parser-box { flex: 1; }
+    .parser-box textarea { width: 100%; height: 200px; }
+    .mapping-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    .mapping-table th, .mapping-table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    .mapping-table .score { font-weight: bold; }
+</style>
+{% endblock %}
+{% block content %}
+<h2>🔗 字段映射分析</h2>
+<p>粘贴两个文件的列名列表，系统将自动匹配相似字段。列名可使用逗号、空格、换行等分隔。</p>
+
+<form id="parserForm">
+    <div class="parser-container">
+        <div class="parser-box">
+            <h3>标准文件列名</h3>
+            <textarea id="textA" name="text_a" placeholder="例如：编号, 姓名, 成绩"></textarea>
+        </div>
+        <div class="parser-box">
+            <h3>比较文件列名</h3>
+            <textarea id="textB" name="text_b" placeholder="例如：ID, 名字, 分数"></textarea>
+        </div>
+    </div>
+    <button type="button" class="btn btn-primary" id="btnAnalyze">开始分析</button>
+    <button type="button" class="btn btn-secondary" id="btnExport" style="display:none;">📥 导出 Excel</button>
+</form>
+
+<div id="resultArea" style="display:none; margin-top: 30px;">
+    <h3>分析结果</h3>
+    <table class="mapping-table" id="mappingTable">
+        <thead><tr><th>标准字段</th><th>比较字段</th><th>相似度</th></tr></thead>
+        <tbody></tbody>
+    </table>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/field_parser.js') }}"></script>
+{% endblock %}

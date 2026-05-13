@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}匹配填充{% endblock %}
+{% block head %}
+<style>
+    .button-group { display: flex; gap: 16px; margin-top: 24px; }
+    .debug-btn { background: var(--warning); color: var(--dark); }
+</style>
+{% endblock %}
+{% block content %}
+<h2>🔗 Excel 数据匹配填充</h2>
+<form id="matchForm" method="post" action="{{ url_for('match.process') }}" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>🎯 目标文件 (保留格式)</label>
+            <input type="file" name="target_file" accept=".xlsx" required>
+            <div class="hint">将保留原有合并单元格、字体等格式</div>
+        </div>
+        <div class="form-row">
+            <label>📁 源文件 (数据源)</label>
+            <input type="file" name="source_file" accept=".xlsx,.xls" required>
+            <div class="hint">支持 .xlsx 和 .xls</div>
+        </div>
+        <div class="form-row">
+            <label>源文件 Sheet 索引 (可选)</label>
+            <input type="text" name="source_sheets" placeholder="例如 1,2,3">
+            <div class="hint">不填默认读取第一个sheet</div>
+        </div>
+    </div>
+    <div class="form-section">
+        <div class="form-row">
+            <label>目标文件键列 (字母，多列逗号分隔)</label>
+            <input type="text" name="target_key_cols" placeholder="A,B" required>
+        </div>
+        <div class="form-row">
+            <label>源文件匹配列 (字母，多列逗号分隔)</label>
+            <input type="text" name="source_match_cols" placeholder="A,B" required>
+        </div>
+        <div class="form-row">
+            <label>源文件值列 (字母)</label>
+            <input type="text" name="source_value_col" placeholder="C" required>
+        </div>
+        <div class="form-row">
+            <label>结果列 (目标文件)</label>
+            <input type="text" name="result_col" placeholder="K 或 '匹配值'" required>
+            <div class="hint">输入列字母覆盖该列；输入其他新建列</div>
+        </div>
+    </div>
+    <div class="button-group">
+        <button type="submit" class="btn btn-success">✨ 开始匹配填充</button>
+        <button type="button" id="debugBtn" class="btn debug-btn">🔍 调试</button>
+    </div>
+</form>
+<script>
+    document.getElementById('debugBtn').addEventListener('click', function() {
+        const form = document.getElementById('matchForm');
+        form.action = '{{ url_for("match.debug") }}';
+        form.target = '_blank';
+        form.submit();
+        form.action = '{{ url_for("match.process") }}';
+        form.target = '';
+    });
+</script>
+{% endblock %}
