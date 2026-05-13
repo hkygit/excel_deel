@@ -259,8 +259,10 @@ def main():
     if choice == 'y':
         force = True
         print("\n⚠️ 您已确认强制推送，本地版本将完全覆盖远程仓库。")
-        confirm = input("再次确认，输入 'YES' 继续: ").strip()
-        if confirm != 'YES':
+        confirm = input("再次确认，输入 'YES' 或 'yes' 继续: ").strip().lower()
+        if confirm == 'yes' or confirm == 'y':
+            print("已确认，继续强制推送...")
+        else:
             print("已取消强制推送，程序退出。")
             sys.exit(0)
 
