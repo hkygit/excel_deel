@@ -6,6 +6,7 @@ from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
 from core.response import make_response
 from services.convert.service import ConvertService
+from core.task.decorator import async_task
 
 logger = logging.getLogger(__name__)
 convert_bp = Blueprint('convert', __name__, url_prefix='/convert', template_folder='../templates/convert')
@@ -29,39 +30,25 @@ def process():
     file.save(save_path)
 
     app = current_app._get_current_object()
-    task_manager = app.container.task_manager()
-    task_storage = app.container.task_storage()
-    task_id = task_manager.create_task(params={}, original_filename='convert')
 
-    def progress_cb(**kw):
+    @async_task(original_filename='convert')
+    def run_conversion(task_id):
         with app.app_context():
-            task_storage.update(task_id, **kw)
+            task_storage = app.container.task_storage()
+            def progress_cb(**kw):
+                task_storage.update(task_id, **kw)
+            service = ConvertService(
+                file_path=save_path,
+                target_format=target_fmt,
+                encoding=encoding,
+                separator=separator,
+                progress_callback=progress_cb
+            )
+            result_path = service.execute()
+            return {'result_path': result_path, 'completed_at': pd.Timestamp.now().isoformat()}
 
-    service = ConvertService(
-        file_path=save_path,
-        target_format=target_fmt,
-        encoding=encoding,
-        separator=separator,
-        progress_callback=progress_cb
-    )
-
-    def run_task():
-        with app.app_context():
-            try:
-                result_path = service.execute()
-                task_storage.update(task_id, status='completed', result_path=result_path,
-                                    completed_at=pd.Timestamp.now().isoformat())
-            except Exception as e:
-                logger.exception("转换失败")
-                task_storage.update(task_id, status='failed', error=str(e))
-            finally:
-                try: os.remove(save_path)
-                except: pass
-                try: os.rmdir(upload_dir)
-                except: pass
-
-    task_manager.start_task(task_id, run_task, ())
-    return make_response(True, {'task_id': task_id})
+    result = run_conversion()
+    return make_response(True, {'task_id': result['task_id']})
 
 @convert_bp.route('/status/<task_id>')
 def status(task_id):

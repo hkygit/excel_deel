@@ -5,6 +5,7 @@ import pandas as pd
 from flask import Blueprint, render_template, request, jsonify, send_file, current_app
 from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
+from core.csv_utils import split_fields
 
 logger = logging.getLogger(__name__)
 field_parser_bp = Blueprint('field_parser', __name__, url_prefix='/field-parser', template_folder='../templates/field_parser')
@@ -32,14 +33,14 @@ def analyze():
         raise ValidationError("请提供 standard_headers 和 compare_headers 字段")
 
     service = current_app.container.field_parser()
-    cols_a = service.parse_field_list(text_a)
-    cols_b = service.parse_field_list(text_b)
+    # 使用 split_fields 解析列名
+    cols_a = split_fields(text_a)
+    cols_b = split_fields(text_b)
 
     if not cols_a or not cols_b:
         raise ValidationError("未能解析出有效的列名，请检查输入格式")
 
     result = service.match_headers(cols_a, cols_b)
-    # 附加原始列名列表，方便后续导出
     result['cols_a'] = cols_a
     result['cols_b'] = cols_b
     return jsonify(result)
@@ -58,9 +59,7 @@ def export():
     cols_a = data.get('cols_a', [])
     cols_b = data.get('cols_b', [])
 
-    # Sheet1: 字段映射表（可编辑）
     rows = []
-    # 添加已匹配项
     for item in matched:
         rows.append({
             '标准字段': item['standard'],
@@ -68,7 +67,6 @@ def export():
             '相似度': item['score'],
             '备注': '自动匹配'
         })
-    # 添加仅标准字段
     for col in only_a:
         rows.append({
             '标准字段': col,
@@ -76,7 +74,6 @@ def export():
             '相似度': '',
             '备注': '仅标准'
         })
-    # 添加仅比较字段
     for col in only_b:
         rows.append({
             '标准字段': '',
@@ -86,7 +83,6 @@ def export():
         })
     df_mapping = pd.DataFrame(rows, columns=['标准字段', '比较字段', '相似度', '备注'])
 
-    # Sheet2: 原始列名参考
     max_len = max(len(cols_a), len(cols_b))
     cols_a_padded = list(cols_a) + [''] * (max_len - len(cols_a))
     cols_b_padded = list(cols_b) + [''] * (max_len - len(cols_b))

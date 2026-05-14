@@ -4,6 +4,7 @@ from flask import Blueprint, render_template, request, jsonify, send_file, curre
 from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
 from datetime import datetime
+from core.task.decorator import async_task
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ def generate():
     mapping_file = request.files.get('mapping_file')
     today_file = request.files.get('today_file')
     yesterday_file = request.files.get('yesterday_file')
-    monthly_files = request.files.getlist('monthly_files')  # 新增
+    monthly_files = request.files.getlist('monthly_files')
 
     if not today_file:
         raise ValidationError("请上传今日司机流水文件")
@@ -51,18 +52,12 @@ def generate():
     monthly_apply_target = request.form.get('monthly_apply_target') or None
 
     app = current_app._get_current_object()
-    task_manager = app.container.task_manager()
-    task_storage = app.container.task_storage()
 
-    task_id = task_manager.create_task(
-        params={'mapping_path': mapping_path, 'today_path': today_path,
-                'yesterday_path': yesterday_path, 'monthly_paths': monthly_paths},
-        original_filename='team_report'
-    )
-
-    def run_task():
+    @async_task(original_filename='team_report')
+    def run_report(task_id):
         with app.app_context():
             service = app.container.team_report_service()
+            task_storage = app.container.task_storage()
             try:
                 task_storage.update(task_id, progress_percent=10, progress_message='加载映射...')
                 if mapping_path and os.path.exists(mapping_path):
@@ -77,7 +72,6 @@ def generate():
                     task_storage.update(task_id, progress_percent=50, progress_message='处理昨日数据...')
                     yesterday_df = service._prepare_flow(yesterday_path, mapping)
 
-                # 月度数据处理
                 monthly_df = None
                 if monthly_paths:
                     task_storage.update(task_id, progress_percent=60, progress_message='处理月度数据...')
@@ -110,19 +104,15 @@ def generate():
                              targets['daily_order'], targets['daily_apply'],
                              targets['monthly_order'], targets['monthly_apply'])
 
-                task_storage.update(task_id, status='completed', result_path=result_path,
-                                    progress_percent=100, completed_at=pd.Timestamp.now().isoformat())
-            except Exception as e:
-                logger.exception("生成日报失败")
-                task_storage.update(task_id, status='failed', error=str(e))
+                return {'result_path': result_path, 'completed_at': pd.Timestamp.now().isoformat()}
             finally:
                 for p in [mapping_path, today_path, yesterday_path] + monthly_paths:
                     if p and os.path.exists(p):
                         try: os.remove(p)
                         except: pass
 
-    task_manager.start_task(task_id, run_task, ())
-    return jsonify({'task_id': task_id})
+    result = run_report()
+    return jsonify({'task_id': result['task_id']})
 
 @team_report_bp.route('/status/<task_id>')
 def status(task_id):

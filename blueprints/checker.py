@@ -6,6 +6,7 @@ from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
 from core.response import make_response
 from services.checker import CheckerService
+from core.task.decorator import async_task
 
 logger = logging.getLogger(__name__)
 checker_bp = Blueprint('checker', __name__, url_prefix='/checker', template_folder='../templates/checker')
@@ -36,7 +37,6 @@ def precheck():
 @checker_bp.route('/process', methods=['POST'])
 @handle_exceptions()
 def process():
-    # 保持原有逻辑不变，最后返回 task_id
     files_a = request.files.getlist('files_a')
     files_b = request.files.getlist('files_b')
     if not files_a or not files_b:
@@ -65,32 +65,25 @@ def process():
     pre_svc = CheckerService(files_a=saved_a, files_b=saved_b, config=cfg)
     pre_data = pre_svc.precheck()
 
-    task_storage = app.container.task_storage()
-    task_manager = app.container.task_manager()
-    task_id = task_manager.create_task(params={}, original_filename='checker')
-
-    def progress_cb(**kw):
+    @async_task(original_filename='checker')
+    def run_check(task_id):
         with app.app_context():
-            task_storage.update(task_id, **kw)
+            task_storage = app.container.task_storage()
+            def progress_cb(**kw):
+                task_storage.update(task_id, **kw)
+            service = CheckerService(
+                files_a=saved_a, files_b=saved_b,
+                key_map_a=key_map_a, key_map_b=key_map_b,
+                compare_map=compare_map, filters_a=filters_a,
+                duplicate_action=dup_action, config=cfg,
+                progress_callback=progress_cb,
+                precheck_data=pre_data
+            )
+            result_path = service.execute()
+            return {'result_path': result_path, 'completed_at': pd.Timestamp.now().isoformat()}
 
-    service = CheckerService(files_a=saved_a, files_b=saved_b,
-                             key_map_a=key_map_a, key_map_b=key_map_b,
-                             compare_map=compare_map, filters_a=filters_a,
-                             duplicate_action=dup_action, config=cfg,
-                             progress_callback=progress_cb,
-                             precheck_data=pre_data)
-
-    def run_task():
-        with app.app_context():
-            try:
-                result_path = service.execute()
-                task_storage.update(task_id, status='completed', result_path=result_path, completed_at=pd.Timestamp.now().isoformat())
-            except Exception as e:
-                logger.exception("校验失败")
-                task_storage.update(task_id, status='failed', error=str(e))
-
-    task_manager.start_task(task_id, run_task, ())
-    return make_response(True, {'task_id': task_id})
+    result = run_check()
+    return make_response(True, {'task_id': result['task_id']})
 
 @checker_bp.route('/status/<task_id>')
 def status(task_id):
