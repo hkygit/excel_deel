@@ -38,21 +38,3 @@ class DataReader:
             return DataReader.read_csv(filepath, **kwargs)
         else:
             raise ValueError(f"不支持的文件类型: {ext}")
-
-    @staticmethod
-    def read_csv_streaming(header_path: str, data_paths: List[str],
-                           needed_columns: set, null_markers: Optional[Dict] = None,
-                           clean_columns: Optional[List[str]] = None) -> Iterator[Dict[str, str]]:
-        """
-        流式读取 CSV（用于大文件），逐行返回字典
-        此方法复用 simplify 模块的 StreamingCsvReader 逻辑
-        """
-        from services.simplify.reader import StreamingCsvReader
-        # 先读取表头
-        with open(header_path, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            headers = next(reader)
-        reader = StreamingCsvReader(header_path, data_paths, headers, needed_columns,
-                                    null_markers=null_markers, clean_columns=clean_columns)
-        for row in reader:
-            yield row

@@ -12,10 +12,8 @@ logger = logging.getLogger(__name__)
 
 from blueprints.calculator import calc_bp
 from blueprints.comparator import compare_bp
-from blueprints.filter_tool import filter_bp
 from blueprints.matcher import match_bp
 from blueprints.summarizer import summary_bp
-from blueprints.simplify import simplify_bp
 from blueprints.splitter import splitter_bp
 from blueprints.field_parser import field_parser_bp
 from blueprints.checker import checker_bp
@@ -41,9 +39,7 @@ def scheduled_cleanup(app):
         time.sleep(3600)
         with app.app_context():
             cfg = app.config
-            clean_old_files(cfg['SIMPLIFY_UPLOAD_FOLDER'], cfg['SIMPLIFY_CLEANUP_AGE_HOURS'])
-            clean_old_files(cfg['SIMPLIFY_OUTPUT_FOLDER'], cfg['SIMPLIFY_CLEANUP_AGE_HOURS'])
-            clean_old_files(cfg['SIMPLIFY_TASK_STATUS_FOLDER'], cfg['SIMPLIFY_CLEANUP_AGE_HOURS'])
+            clean_old_files(cfg['UPLOAD_FOLDER'], 24)  # 仅清理通用上传目录
             logger.info("执行定期清理任务")
 
 def create_app():
@@ -63,17 +59,14 @@ def create_app():
     container = Container()
     app.container = container
 
+    # 创建通用上传目录
     os.makedirs(app.config.get('UPLOAD_FOLDER', 'uploads'), exist_ok=True)
-    os.makedirs(app.config['SIMPLIFY_UPLOAD_FOLDER'], exist_ok=True)
-    os.makedirs(app.config['SIMPLIFY_OUTPUT_FOLDER'], exist_ok=True)
-    os.makedirs(app.config['SIMPLIFY_TASK_STATUS_FOLDER'], exist_ok=True)
 
+    # 注册蓝图（移除 pivot, filter, simplify）
     app.register_blueprint(calc_bp, url_prefix='/calc')
     app.register_blueprint(compare_bp, url_prefix='/compare')
-    app.register_blueprint(filter_bp, url_prefix='/filter')
     app.register_blueprint(match_bp, url_prefix='/match')
     app.register_blueprint(summary_bp, url_prefix='/summary')
-    app.register_blueprint(simplify_bp, url_prefix='/simplify')
     app.register_blueprint(splitter_bp, url_prefix='/splitter')
     app.register_blueprint(field_parser_bp, url_prefix='/field-parser')
     app.register_blueprint(checker_bp, url_prefix='/checker')
@@ -81,10 +74,7 @@ def create_app():
     app.register_blueprint(team_report_bp, url_prefix='/team-report')
     app.register_blueprint(transposer_bp, url_prefix='/transposer')
 
-    from services.simplify import init_config as init_simplify_config
-    init_simplify_config(app)
-
-    init_logging(app)  # 初始化结构化日志和请求追踪
+    init_logging(app)
 
     @app.route('/')
     def index():

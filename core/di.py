@@ -14,7 +14,6 @@ from services.excel.calculator import ColumnCalculator
 from services.excel.comparator import ExcelComparator
 from services.excel.filter import ExcelFilter
 from services.excel.aggregator import Aggregator
-from services.simplify.service import SimplifyService
 from services.field_parser import FieldParserService
 from services.checker import CheckerService
 from services.convert.service import ConvertService
@@ -23,7 +22,7 @@ from services.team_report.writer import TeamReportExcelWriter
 
 class Container(containers.DeclarativeContainer):
     config = providers.Singleton(lambda: settings)
-    task_storage = providers.Singleton(TaskStorage, status_dir=config.provided.simplify.task_status_folder, output_dir=config.provided.simplify.output_folder)
+    task_storage = providers.Singleton(TaskStorage, status_dir=settings.output_folder, output_dir=settings.output_folder)
     task_manager = providers.Singleton(TaskManager, storage=task_storage, max_concurrent=3)
     data_reader = providers.Singleton(DataReader)
     data_writer = providers.Singleton(DataWriter)
@@ -36,7 +35,6 @@ class Container(containers.DeclarativeContainer):
     column_calculator = providers.Singleton(ColumnCalculator)
     excel_comparator = providers.Singleton(ExcelComparator)
     excel_filter = providers.Singleton(ExcelFilter)
-    simplify_service = providers.Factory(SimplifyService)
     team_report_service = providers.Factory(
         TeamReportService,
         config=config.provided.team_report
