@@ -44,6 +44,12 @@
             <input type="text" name="result_col" placeholder="K 或 '匹配值'" required>
             <div class="hint">输入列字母覆盖该列；输入其他新建列</div>
         </div>
+        <div class="form-row">
+            <label>
+                <input type="checkbox" name="allow_duplicate_keys" id="allowDupKeys">
+                允许目标键重复（仅将源值填充到首次出现的行，其余行保持不变）
+            </label>
+        </div>
     </div>
     <div class="button-group">
         <button type="submit" class="btn btn-success">✨ 开始匹配填充</button>

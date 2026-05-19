@@ -50,7 +50,6 @@ ENV/
 env/
 
 # === 项目特定 ===
-Excel/
 *.ipynb_checkpoints/
 
 # === 其他可能的大文件 ===
