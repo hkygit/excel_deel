@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}数据小计{% endblock %}
+{% block head %}
+<style>
+    .override-row { display: flex; gap: 10px; margin-bottom: 8px; align-items: center; }
+    .sheets-radio { margin-right: 15px; }
+</style>
+{% endblock %}
+{% block content %}
+<h2>📊 数据小计</h2>
+<p>根据主键列对数据进行分组，在每组最后一行下方插入小计行。</p>
+<form id="subtotalForm" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📁 上传 Excel 文件</label>
+            <input type="file" name="file" accept=".xlsx,.xls" required>
+        </div>
+    </div>
+    <div class="form-section">
+        <h3>🔑 主键列（分组依据，支持多列和范围，如 A,B,C 或 A-C）</h3>
+        <input type="text" name="key_cols" placeholder="A,B" required>
+    </div>
+    <div class="form-section">
+        <h3>📏 维度列（在小计行显示“合计”，可选，支持多列）</h3>
+        <input type="text" name="dimension_cols" placeholder="C,D">
+        <div class="hint">如果指定的列不存在，将报错。</div>
+    </div>
+    <div class="form-section">
+        <h3>🧮 计算列（支持多列和范围）</h3>
+        <input type="text" name="calc_cols" placeholder="E,F,G-H" required>
+    </div>
+    <div class="form-section">
+        <h3>⚙️ 聚合函数</h3>
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <label>默认函数：</label>
+            <select name="agg_func_default" id="aggFuncDefault">
+                <option value="sum">求和</option>
+                <option value="avg">平均值</option>
+                <option value="min">最小值</option>
+                <option value="max">最大值</option>
+                <option value="count">计数</option>
+            </select>
+            <button type="button" class="btn btn-secondary" id="addOverrideBtn">+ 特殊列函数</button>
+        </div>
+        <div id="overrideContainer" style="margin-top:10px;"></div>
+        <div class="hint">点击“+”为特定列设置不同的聚合函数，格式：列字母:函数，如 C:avg</div>
+    </div>
+    <div class="form-section">
+        <h3>📄 处理Sheet</h3>
+        <div>
+            <label class="sheets-radio"><input type="radio" name="sheets_mode" value="1" checked> 仅第一个Sheet</label>
+            <label class="sheets-radio"><input type="radio" name="sheets_mode" value="all"> 所有Sheet</label>
+            <label class="sheets-radio"><input type="radio" name="sheets_mode" value="custom"> 指定Sheet索引（逗号分隔）</label>
+            <input type="text" name="sheets_custom" id="sheetsCustom" placeholder="1,2,3" style="width:150px; display:none;">
+        </div>
+    </div>
+    <button type="submit" class="btn btn-success">开始处理</button>
+</form>
+
+<div id="statusArea" style="display:none; margin-top:20px;">
+    <h3>任务状态</h3>
+    <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+    <p><strong>状态：</strong> <span id="taskStatus">等待中</span></p>
+    <div id="downloadLink"></div>
+</div>
+
+<template id="overrideRowTemplate">
+    <div class="override-row">
+        <span>列：</span>
+        <input type="text" class="override-col" placeholder="C" style="width:80px;">
+        <span>函数：</span>
+        <select class="override-func">
+            <option value="sum">求和</option>
+            <option value="avg">平均值</option>
+            <option value="min">最小值</option>
+            <option value="max">最大值</option>
+            <option value="count">计数</option>
+        </select>
+        <button type="button" class="btn btn-danger" onclick="this.parentElement.remove()">删除</button>
+    </div>
+</template>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/subtotal.js') }}"></script>
+{% endblock %}

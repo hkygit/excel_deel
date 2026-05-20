@@ -21,9 +21,10 @@
                 <li><a href="{{ url_for('splitter.index') }}">✂️ 文件拆分</a></li>
                 <li><a href="{{ url_for('field_parser.index') }}">🔗 字段映射</a></li>
                 <li><a href="{{ url_for('checker.index') }}">✅ 文件校验</a></li>
-                <li><a href="{{ url_for('convert.index') }}">🔄 格式转换</a>
+                <li><a href="{{ url_for('convert.index') }}">🔄 格式转换</a></li>
+                <li><a href="{{ url_for('subtotal.index') }}">📊 数据小计</a></li>
                 <li><a href="{{ url_for('team_report.index') }}">📊 车队日报</a></li>
-                <li><a href="{{ url_for('transposer.index') }}">🔄 行列转置</a></li></li>
+                <li><a href="{{ url_for('transposer.index') }}">🔄 行列转置</a></li>
             </ul>
         </nav>
         {% block content %}{% endblock %}

@@ -6,7 +6,6 @@ from core.di import Container
 from core.config import settings
 from core.logging_setup import init_app as init_logging
 
-# 配置日志（在 app 创建后由 init_logging 接管）
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -20,6 +19,7 @@ from blueprints.checker import checker_bp
 from blueprints.convert import convert_bp
 from blueprints.team_report import team_report_bp
 from blueprints.transposer import transposer_bp
+from blueprints.subtotal import subtotal_bp
 
 def clean_old_files(directory, age_hours):
     now = time.time()
@@ -39,7 +39,7 @@ def scheduled_cleanup(app):
         time.sleep(3600)
         with app.app_context():
             cfg = app.config
-            clean_old_files(cfg['UPLOAD_FOLDER'], 24)  # 仅清理通用上传目录
+            clean_old_files(cfg['UPLOAD_FOLDER'], 24)
             logger.info("执行定期清理任务")
 
 def create_app():
@@ -59,10 +59,8 @@ def create_app():
     container = Container()
     app.container = container
 
-    # 创建通用上传目录
     os.makedirs(app.config.get('UPLOAD_FOLDER', 'uploads'), exist_ok=True)
 
-    # 注册蓝图（移除 pivot, filter, simplify）
     app.register_blueprint(calc_bp, url_prefix='/calc')
     app.register_blueprint(compare_bp, url_prefix='/compare')
     app.register_blueprint(match_bp, url_prefix='/match')
@@ -73,6 +71,7 @@ def create_app():
     app.register_blueprint(convert_bp, url_prefix='/convert')
     app.register_blueprint(team_report_bp, url_prefix='/team-report')
     app.register_blueprint(transposer_bp, url_prefix='/transposer')
+    app.register_blueprint(subtotal_bp, url_prefix='/subtotal')
 
     init_logging(app)
 
