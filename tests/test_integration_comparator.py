@@ -1,3 +1,4 @@
+# tests/test_integration_comparator.py
 import io
 import json
 import pandas as pd
@@ -16,7 +17,9 @@ class TestComparatorIntegration:
         }
         response = client.post('/compare/process', data=data, content_type='multipart/form-data')
         assert response.status_code == 200
-        assert 'comparison_result.xlsx' in response.headers['Content-Disposition']
+        content_disp = response.headers['Content-Disposition']
+        # 新文件名格式：compare_file1_对比结果.xlsx
+        assert 'compare_file1_' in content_disp and '.xlsx' in content_disp
         result = pd.ExcelFile(io.BytesIO(response.data))
         sheet_names = result.sheet_names
         assert '仅存在于文件2' in sheet_names
@@ -33,7 +36,8 @@ class TestComparatorIntegration:
         }
         response = client.post('/compare/process', data=data, content_type='multipart/form-data')
         assert response.status_code == 200
-        assert 'filename=' in response.headers['Content-Disposition']
+        content_disp = response.headers.get('Content-Disposition', '')
+        assert 'filename=' in content_disp
 
     def test_no_difference_response(self, client):
         import pandas as pd

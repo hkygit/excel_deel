@@ -7,6 +7,7 @@ from core.exceptions import ValidationError
 from core.response import make_response
 from services.checker import CheckerService
 from core.task.decorator import async_task
+from core.file_naming import generate_output_filename
 
 logger = logging.getLogger(__name__)
 checker_bp = Blueprint('checker', __name__, url_prefix='/checker', template_folder='../templates/checker')
@@ -101,7 +102,10 @@ def download(task_id):
     path = data['result_path']
     if not path or not os.path.exists(path):
         return make_response(False, None, '文件不存在', 404)
-    return send_file(path, as_attachment=True, download_name='校验结果.xlsx')
+    # 获取原始文件名用于生成下载名
+    original_filename = data.get('original_filename', '校验结果.xlsx')
+    download_name = generate_output_filename('checker', original_filename, suffix='_校验结果')
+    return send_file(path, as_attachment=True, download_name=download_name)
 
 @checker_bp.route('/')
 def index():

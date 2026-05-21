@@ -5,15 +5,13 @@ from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
 from datetime import datetime
 from core.task.decorator import async_task
+from core.file_naming import generate_output_filename
 
 logger = logging.getLogger(__name__)
-
-team_report_bp = Blueprint('team_report', __name__, url_prefix='/team-report',
-                           template_folder='../templates/team_report')
+team_report_bp = Blueprint('team_report', __name__, url_prefix='/team-report', template_folder='../templates/team_report')
 
 def _save_uploaded(file, prefix='tr_'):
-    if not file or file.filename == '':
-        return None
+    if not file or file.filename == '': return None
     from werkzeug.utils import secure_filename
     upload_dir = tempfile.mkdtemp(prefix=prefix)
     safe_name = secure_filename(file.filename)
@@ -39,12 +37,7 @@ def generate():
     mapping_path = _save_uploaded(mapping_file, prefix='mapping_') if mapping_file else None
     today_path = _save_uploaded(today_file, prefix='today_')
     yesterday_path = _save_uploaded(yesterday_file, prefix='yesterday_') if yesterday_file else None
-    monthly_paths = []
-    for mf in monthly_files:
-        if mf and mf.filename:
-            p = _save_uploaded(mf, prefix='monthly_')
-            if p:
-                monthly_paths.append(p)
+    monthly_paths = [_save_uploaded(mf, prefix='monthly_') for mf in monthly_files if mf and mf.filename]
 
     daily_order_target = request.form.get('daily_order_target') or None
     daily_apply_target = request.form.get('daily_apply_target') or None
@@ -118,8 +111,7 @@ def generate():
 def status(task_id):
     storage = current_app.container.task_storage()
     data = storage.load(task_id)
-    if not data:
-        return jsonify({'error': '任务不存在'}), 404
+    if not data: return jsonify({'error': '任务不存在'}), 404
     return jsonify(data)
 
 @team_report_bp.route('/download/<task_id>')
@@ -131,13 +123,11 @@ def download(task_id):
     path = data.get('result_path')
     if not path or not os.path.exists(path):
         return jsonify({'error': '文件不存在'}), 404
-    response = send_file(
-        path,
-        as_attachment=True,
-        download_name='每日数据对比.xlsx',
-        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        conditional=True
-    )
+    original = data.get('original_filename', 'team_report.xlsx')
+    download_name = generate_output_filename('team_report', original, suffix='_每日数据对比')
+    response = send_file(path, as_attachment=True, download_name=download_name,
+                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                         conditional=True)
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'

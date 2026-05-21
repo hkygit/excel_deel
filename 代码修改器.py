@@ -1,183 +1,146 @@
 #!/usr/bin/env python3
 """
-修复 _check_columns 缺少列索引范围检查的问题
-仅修改 blueprints/subtotal.py
+静态检查：验证所有生成 Excel 的蓝图是否使用了统一的文件命名函数
 """
 import os
+import ast
+import sys
 
-FIXED_SUBTOTAL_BP = '''# blueprints/subtotal.py
-import os
-import logging
-import openpyxl
-from flask import Blueprint, render_template, request, send_file, current_app, jsonify
-from core.decorators import handle_exceptions
-from core.exceptions import ValidationError
-from core.task.decorator import async_task
-from services.subtotal.engine import SubtotalEngine, _build_header_map, resolve_single_col, parse_cols_with_header
-from core.csv_utils import split_fields
+ROOT = os.path.dirname(os.path.abspath(__file__))
+BLUEPRINTS_DIR = os.path.join(ROOT, 'blueprints')
 
-logger = logging.getLogger(__name__)
-subtotal_bp = Blueprint('subtotal', __name__, url_prefix='/subtotal',
-                        template_folder='../templates/subtotal')
+# 需要检查的蓝图模块及其功能描述（文件名 -> 描述）
+TARGET_MODULES = {
+    'calculator.py': '列计算/聚合回填',
+    'comparator.py': '文件对比',
+    'matcher.py': '匹配填充',
+    'summarizer.py': '汇总工具',
+    'splitter.py': '文件拆分',
+    'subtotal.py': '数据小计',
+    'field_parser.py': '字段映射导出',
+    'checker.py': '文件校验下载',
+    'convert.py': '格式转换下载',
+    'team_report.py': '车队日报下载',
+    'transposer.py': '行列转置',
+}
 
-@subtotal_bp.route('/')
-def index():
-    return render_template('subtotal/index.html')
+def check_import(node):
+    """检查 AST 中是否导入了 generate_output_filename"""
+    for n in ast.walk(node):
+        if isinstance(n, ast.ImportFrom):
+            if n.module == 'core.file_naming':
+                for alias in n.names:
+                    if alias.name == 'generate_output_filename':
+                        return True
+    return False
 
-def _check_columns(raw, category, header_map, max_col):
-    """校验列标识的有效性，并检查列索引是否超出工作表范围"""
-    if not raw:
-        return
-    items = split_fields(raw)
-    for item in items:
-        if '-' in item:
-            parts = item.split('-')
-            if len(parts) != 2:
-                raise ValidationError(f"{category}列范围格式错误：{item}")
-            start, end = parts[0].strip(), parts[1].strip()
-            start_idx = resolve_single_col(start, header_map)
-            end_idx = resolve_single_col(end, header_map)
-            if start_idx > max_col:
-                raise ValidationError(f"{category}列 '{start}' 超出工作表列范围（共{max_col}列）")
-            if end_idx > max_col:
-                raise ValidationError(f"{category}列 '{end}' 超出工作表列范围（共{max_col}列）")
-        else:
-            idx = resolve_single_col(item, header_map)
-            if idx > max_col:
-                raise ValidationError(f"{category}列 '{item}' 超出工作表列范围（共{max_col}列）")
+def check_usage_in_function(node, func_name):
+    """检查指定函数内是否调用了 generate_output_filename"""
+    for n in ast.walk(node):
+        if isinstance(n, ast.FunctionDef) and n.name == func_name:
+            # 遍历函数体中的调用
+            for sub in ast.walk(n):
+                if isinstance(sub, ast.Call):
+                    # 直接调用 generate_output_filename(...)
+                    if isinstance(sub.func, ast.Name) and sub.func.id == 'generate_output_filename':
+                        return True, '直接调用'
+                    # 从模块调用，如 core.file_naming.generate_output_filename
+                    if isinstance(sub.func, ast.Attribute):
+                        if sub.func.attr == 'generate_output_filename':
+                            # 检查是否赋值给了 download_name
+                            return True, '模块调用'
+            # 如果没有找到，可能是在 send_file 的 download_name 中使用
+            for sub in ast.walk(n):
+                if isinstance(sub, ast.keyword) and sub.arg == 'download_name':
+                    if isinstance(sub.value, ast.Call) and isinstance(sub.value.func, ast.Name) and sub.value.func.id == 'generate_output_filename':
+                        return True, 'download_name参数'
+                    if isinstance(sub.value, ast.Call) and isinstance(sub.value.func, ast.Attribute) and sub.value.func.attr == 'generate_output_filename':
+                        return True, 'download_name参数'
+            return False, ''
+    return False, ''
 
-@subtotal_bp.route('/process', methods=['POST'])
-@handle_exceptions()
-def process():
-    file = request.files.get('file')
-    if not file or file.filename == '':
-        raise ValidationError('请上传文件')
+def check_module(filepath):
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+    try:
+        tree = ast.parse(content)
+    except SyntaxError as e:
+        return {'imported': False, 'used': False, 'error': str(e)}
 
-    original_filename = file.filename
-    key_cols_raw = request.form.get('key_cols', '').strip()
-    if not key_cols_raw:
-        raise ValidationError('请指定主键列')
+    imported = check_import(tree)
 
-    dimension_cols_raw = request.form.get('dimension_cols', '').strip() or None
-    calc_cols_raw = request.form.get('calc_cols', '').strip()
-    if not calc_cols_raw:
-        raise ValidationError('请指定计算列')
-
-    agg_func_default = request.form.get('agg_func_default', 'sum').strip()
-    agg_overrides_raw = request.form.get('agg_overrides', '').strip()
-    sheets_mode = request.form.get('sheets_mode', '1').strip()
-
-    file_service = current_app.container.file_service()
-    path = file_service.save_upload(file, allowed_extensions={'xlsx', 'xls'})
-
-    # 读取表头用于列名校验
-    wb = openpyxl.load_workbook(path)
-    first_ws = wb.active
-    max_col = first_ws.max_column
-    header_map = _build_header_map(first_ws)
-    wb.close()
-
-    _check_columns(key_cols_raw, '主键', header_map, max_col)
-    _check_columns(calc_cols_raw, '计算', header_map, max_col)
-    if dimension_cols_raw:
-        _check_columns(dimension_cols_raw, '维度', header_map, max_col)
-
-    agg_funcs = {'default': agg_func_default}
-    if agg_overrides_raw:
-        for part in agg_overrides_raw.split(','):
-            if ':' in part:
-                col, func = part.split(':', 1)
-                col = col.strip().upper()
-                func = func.strip().lower()
-                if func not in ('sum', 'avg', 'min', 'max', 'count'):
-                    raise ValidationError(f"不支持的聚合函数: {func}")
-                try:
-                    openpyxl.utils.column_index_from_string(col)
-                except:
-                    raise ValidationError(f"无效的列字母: {col}")
-                agg_funcs[col] = func
-
-    wb2 = openpyxl.load_workbook(path, read_only=True)
-    total_rows = sum(sheet.max_row for sheet in wb2.worksheets)
-    wb2.close()
-    data_rows = total_rows - 1
-
-    app = current_app._get_current_object()
-
-    if data_rows > 5000:
-        task_storage = app.container.task_storage()
-
-        @async_task(original_filename='subtotal')
-        def run_subtotal(task_id):
-            with app.app_context():
-                def progress_cb(percent, message):
-                    task_storage.update(task_id, progress_percent=percent, progress_message=message)
-                try:
-                    progress_cb(0, "开始处理...")
-                    engine = SubtotalEngine(
-                        path, key_cols_raw, calc_cols_raw, agg_funcs,
-                        dimension_cols=dimension_cols_raw,
-                        sheets=sheets_mode,
-                        original_filename=original_filename
-                    )
-                    out_path = engine.process()
-                    progress_cb(100, "完成")
-                    return {'result_path': out_path}
-                except Exception as e:
-                    import traceback
-                    error_msg = f"{str(e)}\\n{traceback.format_exc()}"
-                    task_storage.append_log(task_id, error_msg)
-                    raise
-                finally:
-                    file_service.cleanup([path])
-
-        result = run_subtotal()
-        return jsonify({'task_id': result['task_id']})
-    else:
-        try:
-            engine = SubtotalEngine(
-                path, key_cols_raw, calc_cols_raw, agg_funcs,
-                dimension_cols=dimension_cols_raw,
-                sheets=sheets_mode,
-                original_filename=original_filename
-            )
-            out_path = engine.process()
-            return send_file(out_path, as_attachment=True,
-                             download_name=os.path.basename(out_path),
-                             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        finally:
-            file_service.cleanup([path])
-
-@subtotal_bp.route('/status/<task_id>')
-def status(task_id):
-    storage = current_app.container.task_storage()
-    data = storage.load(task_id)
-    if not data:
-        return jsonify({'error': '任务不存在'}), 404
-    log = storage.get_log(task_id, max_lines=100)
-    data['log'] = log
-    return jsonify(data)
-
-@subtotal_bp.route('/download/<task_id>')
-def download(task_id):
-    storage = current_app.container.task_storage()
-    data = storage.load(task_id)
-    if not data or data.get('status') != 'completed':
-        return jsonify({'error': '结果不可用'}), 400
-    path = data.get('result_path')
-    if not path or not os.path.exists(path):
-        return jsonify({'error': '文件不存在'}), 404
-    return send_file(path, as_attachment=True, download_name='subtotal_result.xlsx')
-'''
+    # 查找可能的下载函数：通常为 download、export、或者直接返回 send_file 的视图函数
+    used = False
+    detail = ''
+    # 检查所有函数
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            # 常见的下载/导出函数名
+            if node.name in ('download', 'export', 'convert', 'process', 'generate', 'debug'):
+                # 在这些函数中查找是否有 generate_output_filename 的使用
+                # 遍历函数体中的 send_file 调用
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == 'send_file':
+                        # 检查 download_name 参数
+                        for kw in sub.keywords:
+                            if kw.arg == 'download_name':
+                                if isinstance(kw.value, ast.Call):
+                                    if isinstance(kw.value.func, ast.Name) and kw.value.func.id == 'generate_output_filename':
+                                        used = True
+                                        detail = f'在函数 {node.name} 的 download_name 中使用'
+                                break
+                if not used:
+                    # 也可能是先调用 generate_output_filename 再作为变量传给 send_file
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.Assign):
+                            for target in sub.targets:
+                                if isinstance(target, ast.Name):
+                                    if isinstance(sub.value, ast.Call) and isinstance(sub.value.func, ast.Name) and sub.value.func.id == 'generate_output_filename':
+                                        used = True
+                                        detail = f'在函数 {node.name} 中赋值给变量 {target.id}'
+    return {'imported': imported, 'used': used, 'detail': detail}
 
 def main():
-    root = os.path.dirname(os.path.abspath(__file__))
-    full_path = os.path.join(root, 'blueprints', 'subtotal.py')
-    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    with open(full_path, 'w', encoding='utf-8') as f:
-        f.write(FIXED_SUBTOTAL_BP)
-    print("已修复 blueprints/subtotal.py：_check_columns 现在检查列索引是否超出范围。")
-    print("请运行 pytest 验证：python -m pytest tests/test_integration_subtotal.py::TestSubtotalIntegration::test_missing_dimension_col -v")
+    print("=" * 60)
+    print("统一文件命名静态检查")
+    print("=" * 60)
+    results = {}
+    for filename, desc in TARGET_MODULES.items():
+        filepath = os.path.join(BLUEPRINTS_DIR, filename)
+        if not os.path.exists(filepath):
+            results[filename] = {'desc': desc, 'status': '文件不存在'}
+            continue
+        check_result = check_module(filepath)
+        results[filename] = {**check_result, 'desc': desc}
+
+    # 输出表格
+    print(f"{'模块':<20} {'功能':<16} {'导入':<6} {'使用':<6} {'详情'}")
+    print("-" * 70)
+    for fname, info in results.items():
+        if 'status' in info:
+            print(f"{fname:<20} {info['desc']:<16} {'❌':<6} {'❌':<6} {info['status']}")
+        else:
+            imp = '✅' if info['imported'] else '❌'
+            use = '✅' if info['used'] else '❌'
+            detail = info.get('detail', '')
+            print(f"{fname:<20} {info['desc']:<16} {imp:<6} {use:<6} {detail}")
+
+    print("\n总结：")
+    all_ok = all(
+        'status' not in info and info.get('imported') and info.get('used')
+        for info in results.values()
+    )
+    if all_ok:
+        print("✅ 所有模块均已导入并使用统一命名函数。")
+    else:
+        print("⚠️ 以下模块需要修复：")
+        for fname, info in results.items():
+            if 'status' in info:
+                print(f"  - {fname}: {info['status']}")
+            elif not info.get('imported'):
+                print(f"  - {fname}: 未导入 generate_output_filename")
+            elif not info.get('used'):
+                print(f"  - {fname}: 未在下载/导出中使用 generate_output_filename")
 
 if __name__ == '__main__':
     main()

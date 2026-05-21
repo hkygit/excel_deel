@@ -8,6 +8,7 @@ from services import FileService
 from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
 from core.response import error_response, success_response
+from core.file_naming import generate_output_filename
 from schemas.comparator import CompareFullParams, CompareFieldMatchParams
 from services.excel.comparator import ExcelComparator
 
@@ -61,7 +62,8 @@ def process():
             if not sheet_written:
                 return jsonify({'code': 200, 'message': '没有发现任何差异'}), 200
             output.seek(0)
-            return send_file(output, as_attachment=True, download_name='comparison_result.xlsx',
+            download_name = generate_output_filename('compare', file1.filename, suffix='_对比结果')
+            return send_file(output, as_attachment=True, download_name=download_name,
                              mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         else:
             match_field = request.form.get('match_field', '').strip()
@@ -82,7 +84,8 @@ def process():
                 for sheet_name, df in output_data:
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
             output.seek(0)
-            return send_file(output, as_attachment=True, download_name='差异结果.xlsx',
+            download_name = generate_output_filename('compare', file1.filename, suffix='_字段差异')
+            return send_file(output, as_attachment=True, download_name=download_name,
                              mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     finally:
         file_service.cleanup([path1, path2])

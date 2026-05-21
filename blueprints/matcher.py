@@ -5,6 +5,7 @@ from flask import Blueprint, render_template, request, send_file, current_app
 
 from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
+from core.file_naming import generate_output_filename
 from services.excel.matcher import ExcelMatcher
 
 logger = logging.getLogger(__name__)
@@ -18,15 +19,13 @@ def _check_target_extension(filename: str):
         raise ValidationError(f"目标文件格式不支持，请使用 .xlsx 格式（当前: {ext}）。如为 .xls 文件，请先用 Excel 另存为 .xlsx。")
 
 def _fix_target_extension(filepath: str) -> str:
-    """确保目标文件路径以 .xlsx 结尾，否则重命名文件"""
     if not filepath.lower().endswith('.xlsx'):
         new_path = filepath + '.xlsx'
         try:
             os.rename(filepath, new_path)
-            logger.info(f"目标文件扩展名已修正: {filepath} -> {new_path}")
             return new_path
-        except Exception as e:
-            logger.error(f"重命名文件失败: {e}")
+        except Exception:
+            pass
     return filepath
 
 @match_bp.route('/')
@@ -46,7 +45,7 @@ def process():
     _check_target_extension(target_file.filename)
 
     target_path = file_service.save_upload(target_file)
-    target_path = _fix_target_extension(target_path)   # 修复扩展名
+    target_path = _fix_target_extension(target_path)
     source_path = file_service.save_upload(source_file)
 
     config = {
@@ -76,7 +75,8 @@ def process():
         error_msg = result if isinstance(result, str) else '\n'.join(result)
         raise ValidationError(error_msg)
 
-    return send_file(result, as_attachment=True, download_name=f"matched_{target_file.filename}")
+    download_name = generate_output_filename('match', target_file.filename, suffix='_匹配结果')
+    return send_file(result, as_attachment=True, download_name=download_name)
 
 @match_bp.route('/debug', methods=['POST'])
 @handle_exceptions()
@@ -91,7 +91,7 @@ def debug():
     _check_target_extension(target_file.filename)
 
     target_path = file_service.save_upload(target_file)
-    target_path = _fix_target_extension(target_path)   # 修复扩展名
+    target_path = _fix_target_extension(target_path)
     source_path = file_service.save_upload(source_file)
 
     config = {

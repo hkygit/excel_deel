@@ -6,8 +6,9 @@ from flask import Blueprint, render_template, request, send_file, current_app, j
 from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
 from core.task.decorator import async_task
-from services.subtotal.engine import SubtotalEngine, _build_header_map, resolve_single_col, parse_cols_with_header
+from services.subtotal.engine import SubtotalEngine, _build_header_map, resolve_single_col
 from core.csv_utils import split_fields
+from core.file_naming import generate_output_filename
 
 logger = logging.getLogger(__name__)
 subtotal_bp = Blueprint('subtotal', __name__, url_prefix='/subtotal',
@@ -18,7 +19,6 @@ def index():
     return render_template('subtotal/index.html')
 
 def _check_columns(raw, category, header_map, max_col):
-    """校验列标识的有效性，并检查列索引是否超出工作表范围"""
     if not raw:
         return
     items = split_fields(raw)
@@ -63,7 +63,6 @@ def process():
     file_service = current_app.container.file_service()
     path = file_service.save_upload(file, allowed_extensions={'xlsx', 'xls'})
 
-    # 读取表头用于列名校验
     wb = openpyxl.load_workbook(path)
     first_ws = wb.active
     max_col = first_ws.max_column
@@ -115,7 +114,8 @@ def process():
                     )
                     out_path = engine.process()
                     progress_cb(100, "完成")
-                    return {'result_path': out_path}
+                    # 保存原始文件名到任务数据中，便于下载时生成统一名称
+                    return {'result_path': out_path, 'original_filename': original_filename}
                 except Exception as e:
                     import traceback
                     error_msg = f"{str(e)}\n{traceback.format_exc()}"
@@ -135,6 +135,7 @@ def process():
                 original_filename=original_filename
             )
             out_path = engine.process()
+            # 同步下载使用引擎生成的路径中的文件名（已含统一前缀）
             return send_file(out_path, as_attachment=True,
                              download_name=os.path.basename(out_path),
                              mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
@@ -160,4 +161,8 @@ def download(task_id):
     path = data.get('result_path')
     if not path or not os.path.exists(path):
         return jsonify({'error': '文件不存在'}), 404
-    return send_file(path, as_attachment=True, download_name='subtotal_result.xlsx')
+
+    # 使用统一命名函数生成下载名
+    original_filename = data.get('original_filename', 'data.xlsx')
+    download_name = generate_output_filename('subtotal', original_filename, suffix='_小计')
+    return send_file(path, as_attachment=True, download_name=download_name)

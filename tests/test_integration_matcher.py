@@ -21,14 +21,13 @@ class TestMatcherIntegration:
 
     @pytest.fixture
     def target_file_duplicate(self):
-        """目标文件有重复键"""
         wb = Workbook()
         ws = wb.active
         ws['A1'] = 'ID'
         ws['B1'] = 'Value'
         ws['A2'] = 1
         ws['B2'] = ''
-        ws['A3'] = 1   # 重复键
+        ws['A3'] = 1
         ws['B3'] = ''
         ws['A4'] = 2
         ws['B4'] = ''
@@ -56,7 +55,10 @@ class TestMatcherIntegration:
         }
         response = client.post('/match/process', data=data, content_type='multipart/form-data')
         assert response.status_code == 200
-        assert 'matched_' in response.headers['Content-Disposition']
+        content_disp = response.headers.get('Content-Disposition', '')
+        assert 'attachment' in content_disp
+        # 新格式：match_原文件名_匹配结果.xlsx
+        assert 'match_target_' in content_disp or 'match_target.xlsx' in content_disp
         result_df = pd.read_excel(io.BytesIO(response.data))
         assert result_df.loc[0, 'Value'] == 100
         assert result_df.loc[1, 'Value'] == 200
@@ -75,7 +77,6 @@ class TestMatcherIntegration:
         assert 'config' in response.data.decode('utf-8')
 
     def test_match_with_duplicate_keys_disabled(self, client, target_file_duplicate, source_file):
-        """默认不勾选，所有匹配的行均应填充相同值"""
         data = {
             'target_file': (target_file_duplicate, 'target_dup.xlsx'),
             'source_file': (source_file, 'source.xlsx'),
@@ -83,18 +84,15 @@ class TestMatcherIntegration:
             'source_match_cols': 'A',
             'source_value_col': 'B',
             'result_col': 'B',
-            # 不传 allow_duplicate_keys，默认 off
         }
         response = client.post('/match/process', data=data, content_type='multipart/form-data')
-        assert response.status_code == 200
-        result_df = pd.read_excel(io.BytesIO(response.data))
-        # 两行 ID=1 都应该被填充 100
-        assert result_df.loc[0, 'Value'] == 100
-        assert result_df.loc[1, 'Value'] == 100
-        assert result_df.loc[2, 'Value'] == 200   # ID=2
+        assert response.status_code == 400
+        resp_json = response.get_json()
+        assert resp_json is not None
+        assert not resp_json['success']
+        assert '重复' in resp_json['error']
 
     def test_match_with_duplicate_keys_enabled(self, client, target_file_duplicate, source_file):
-        """勾选允许重复键，仅首行填充，其余行为原值（空）"""
         data = {
             'target_file': (target_file_duplicate, 'target_dup.xlsx'),
             'source_file': (source_file, 'source.xlsx'),
@@ -102,16 +100,12 @@ class TestMatcherIntegration:
             'source_match_cols': 'A',
             'source_value_col': 'B',
             'result_col': 'B',
-            'allow_duplicate_keys': 'on',   # 勾选
+            'allow_duplicate_keys': 'on',
         }
         response = client.post('/match/process', data=data, content_type='multipart/form-data')
         assert response.status_code == 200
         result_df = pd.read_excel(io.BytesIO(response.data))
-        # 第一行 ID=1 填充 100
         assert result_df.loc[0, 'Value'] == 100
-        # 第二行 ID=1 应保持为空（原有空值）
-        # 注意 pandas 读回空值可能是 NaN，判断用 pd.isna
         val_second = result_df.loc[1, 'Value']
         assert val_second == '' or pd.isna(val_second)
-        # 第三行 ID=2 填充 200
         assert result_df.loc[2, 'Value'] == 200

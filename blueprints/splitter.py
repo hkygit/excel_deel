@@ -13,11 +13,10 @@ from core.validators import sanitize_filename
 from core.decorators import handle_exceptions
 from core.exceptions import ValidationError
 from core.filter_engine import parse_conditions_from_form, ConditionEngine
+from core.file_naming import generate_output_filename
 
 logger = logging.getLogger(__name__)
 splitter_bp = Blueprint('splitter', __name__, url_prefix='/splitter', template_folder='../templates/splitter')
-
-# ========== 工具函数 ==========
 
 def copy_cell(source_cell, target_cell):
     try:
@@ -87,7 +86,6 @@ def copy_worksheet_without_data(source_ws, target_wb, keep_rows_set):
     return target_ws
 
 def repair_excel_with_pandas(input_path):
-    """尝试用 pandas 修复无法打开的 Excel 文件，注意：此方法会丢失公式和样式"""
     import pandas as pd
     temp_xlsx = tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False)
     temp_xlsx.close()
@@ -114,7 +112,7 @@ def repair_excel_with_pandas(input_path):
     return temp_xlsx.name
 
 def split_excel_to_temp(input_path, split_column_name, include_values, exclude_values, skip_sheet_indices, temp_dir):
-    wb = load_workbook(input_path, data_only=True)   # 读取公式计算结果
+    wb = load_workbook(input_path, data_only=True)
     sheets = wb.worksheets
     first_sheet = sheets[0]
     headers = [cell.value for cell in first_sheet[1]]
@@ -168,10 +166,6 @@ def split_excel_to_temp(input_path, split_column_name, include_values, exclude_v
     return generated_files
 
 def filter_workbook_inplace(input_path, form, skip_sheet_indices=None):
-    """
-    在 openpyxl 层面筛选行，保留样式、公式结果和合并单元格。
-    使用 data_only=True 读取，确保公式计算结果可用。
-    """
     if skip_sheet_indices is None:
         skip_sheet_indices = set()
 
@@ -181,7 +175,7 @@ def filter_workbook_inplace(input_path, form, skip_sheet_indices=None):
 
     engine = ConditionEngine()
 
-    wb = load_workbook(input_path, data_only=True)   # 关键：读取缓存的计算结果
+    wb = load_workbook(input_path, data_only=True)
     try:
         for idx, ws in enumerate(wb.worksheets, start=1):
             if idx in skip_sheet_indices:
@@ -252,7 +246,6 @@ def process():
         os.rename(save_path, new_path)
         save_path = new_path
 
-    # 尝试用 data_only=True 打开，若失败则修复（修复会丢失公式，但至少能继续）
     try:
         load_workbook(save_path, data_only=True)
     except Exception:
@@ -285,8 +278,7 @@ def process():
             from datetime import datetime
             original_name = os.path.splitext(file.filename)[0]
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            download_name = f"{sanitize_filename(original_name)}_拆分_{timestamp}.zip"
-
+            download_name = generate_output_filename('splitter', file.filename, suffix='_拆分结果')
             return send_file(
                 zip_buffer.name,
                 as_attachment=True,

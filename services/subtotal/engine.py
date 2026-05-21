@@ -57,7 +57,6 @@ class SubtotalEngine:
         self.agg_funcs = agg_funcs
         self.sheets = sheets
         self.detector = SimpleExcelHeaderDetector()
-        # 以下在process中根据表头解析
         self.key_cols = []
         self.calc_cols = []
         self.dimension_cols = []
@@ -67,17 +66,14 @@ class SubtotalEngine:
 
     def process(self):
         wb = openpyxl.load_workbook(self.filepath)
-        # 获取第一个工作表的表头用于列名解析
         first_ws = wb.active
         header_map = _build_header_map(first_ws)
 
-        # 解析所有列
         self.key_cols = parse_cols_with_header(self.key_cols_raw, header_map)
         self.calc_cols = parse_cols_with_header(self.calc_cols_raw, header_map)
         if self.dimension_cols_raw:
             self.dimension_cols = parse_cols_with_header(self.dimension_cols_raw, header_map)
 
-        # 检测表头
         header_result = self.detector.detect_from_workbook(wb)
         data_start_excel_row = header_result.get_data_start_excel_row()
 
@@ -108,7 +104,14 @@ class SubtotalEngine:
         groups = {}
         for row_idx in range(data_start_row, max_row + 1):
             key = tuple(ws.cell(row_idx, col).value for col in self.key_cols)
+            # ---- 修复：跳过主键全为空的行（避免生成无意义的小计行） ----
+            if all(v is None or str(v).strip() == '' for v in key):
+                continue
             groups.setdefault(key, []).append(row_idx)
+
+        # 如果没有有效组，直接返回
+        if not groups:
+            return
 
         sorted_groups = sorted(groups.items(), key=lambda x: max(x[1]), reverse=True)
 

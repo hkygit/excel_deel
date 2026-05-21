@@ -47,7 +47,7 @@ class HeaderDetectionConfig:
 class HeaderDetectionResult:
     def __init__(self):
         self.header_rows: List[int] = []
-        self.data_start_row: int = 0          # 0-based
+        self.data_start_row: int = 0
         self.column_names: List[str] = []
         self.confidence: float = 0.0
         self.reason: str = ""
@@ -60,7 +60,6 @@ class HeaderDetectionResult:
         return bool(self.header_rows) and self.confidence >= 0.1
 
     def get_data_start_excel_row(self) -> int:
-        """返回1-based的数据起始行"""
         return self.data_start_row + 1 if self.data_start_row >= 0 else 1
 
 class SimpleExcelHeaderDetector:
@@ -162,10 +161,7 @@ class SimpleExcelHeaderDetector:
         else:
             result = self._create_fallback_result()
             if data:
-                result.column_names = [
-                    str(cell).strip() if cell is not None and str(cell).strip()
-                    else f"Col_{i+1}" for i, cell in enumerate(data[0])
-                ]
+                result.column_names = [str(c).strip() if cell is not None and str(cell).strip() else f"Col_{i+1}" for i, cell in enumerate(data[0])]
         result.metrics.update({
             'execution_time_ms': (time.time() - start_time) * 1000,
             'rows_checked': len(data),
@@ -176,12 +172,7 @@ class SimpleExcelHeaderDetector:
 
     def _read_cell_range(self, ws, min_row, max_row, min_col, max_col):
         try:
-            return [
-                [cell for cell in row]
-                for row in ws.iter_rows(min_row=min_row, max_row=max_row,
-                                        min_col=min_col, max_col=max_col,
-                                        values_only=True)
-            ]
+            return [[cell for cell in row] for row in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col, values_only=True)]
         except Exception as e:
             logger.warning(f"读取单元格失败: {e}")
             return []
@@ -192,12 +183,10 @@ class SimpleExcelHeaderDetector:
         row_data = data[row_idx]
         if not row_data:
             return self._create_candidate(row_idx, 0, "空行")
-
         non_empty = [cell for cell in row_data if cell is not None and str(cell).strip() != '']
         non_empty_ratio = len(non_empty) / len(row_data) if row_data else 0
         if non_empty_ratio < 0.2:
             return self._create_candidate(row_idx, 0, f"非空{non_empty_ratio:.0%}")
-
         string_cells = []
         for cell in non_empty:
             s = str(cell).strip()
@@ -206,17 +195,13 @@ class SimpleExcelHeaderDetector:
         string_ratio = len(string_cells) / len(row_data) if row_data else 0
         unique_strings = set(string_cells)
         dup_ratio = 1 - len(unique_strings) / len(string_cells) if string_cells else 0
-
         keyword_matches = sum(1 for s in string_cells for kw in self._keyword_set if kw in s.lower())
         keyword_ratio = keyword_matches / len(string_cells) if string_cells else 0
-
         combined = ' '.join(string_cells).lower()
         if any(skip in combined for skip in self._skip_set):
             return self._create_candidate(row_idx, 0, "跳过关键词")
-
         valid_fmt = sum(1 for s in string_cells if self._is_valid_column_name(s))
         valid_fmt_ratio = valid_fmt / len(string_cells) if string_cells else 0
-
         score = 0.0
         reasons = []
         if non_empty_ratio >= self.config.min_non_empty_ratio:
@@ -230,38 +215,22 @@ class SimpleExcelHeaderDetector:
         if valid_fmt_ratio > 0.5:
             score += 0.1; reasons.append("格式正确")
         score = max(0.0, min(1.0, score))
-
-        column_names = [
-            str(cell).strip() if cell is not None and str(cell).strip() != '' else f"Col_{i+1}"
-            for i, cell in enumerate(row_data)
-        ]
-        return {
-            'row': row_idx, 'score': score,
-            'reason': ', '.join(reasons) or '基础特征',
-            'column_names': column_names,
-            'metrics': {}
-        }
+        column_names = [str(cell).strip() if cell is not None and str(cell).strip() != '' else f"Col_{i+1}" for i, cell in enumerate(row_data)]
+        return {'row': row_idx, 'score': score, 'reason': ', '.join(reasons) or '基础特征', 'column_names': column_names, 'metrics': {}}
 
     def _create_candidate(self, row_idx, score, reason):
         return {'row': row_idx, 'score': score, 'reason': reason, 'column_names': [], 'metrics': {}}
 
     def _is_numeric(self, s: str) -> bool:
         s = s.strip().replace(',', '')
-        if s.endswith('%'):
-            s = s[:-1]
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
+        if s.endswith('%'): s = s[:-1]
+        try: float(s); return True
+        except ValueError: return False
 
     def _is_valid_column_name(self, s: str) -> bool:
-        if not s or len(s) > 50:
-            return False
-        if re.match(r'^[\d.,%\s-]+$', s):
-            return False
-        if self._invalid_chars_regex.search(s):
-            return False
+        if not s or len(s) > 50: return False
+        if re.match(r'^[\d.,%\s-]+$', s): return False
+        if self._invalid_chars_regex.search(s): return False
         return s.strip() != ''
 
     def _create_fallback_result(self) -> HeaderDetectionResult:
@@ -276,9 +245,7 @@ class SimpleExcelHeaderDetector:
         self._cache.clear()
         self._workbook_cache.clear()
 
-
 def detect_header_start(file_path: str, sheet_name: str = None) -> int:
-    """返回数据起始行（1-based），失败返回2"""
     detector = SimpleExcelHeaderDetector()
     try:
         result = detector.detect_headers(file_path, sheet_name)

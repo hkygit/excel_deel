@@ -130,6 +130,17 @@ class ExcelMatcher:
                 lookup[key] = row[value_col_name]
         return lookup, match_len
 
+    def _check_duplicate_target_keys(self, target_keys):
+        """检查目标键是否重复，返回重复的键列表"""
+        seen = set()
+        duplicates = set()
+        for key in target_keys:
+            if key in seen:
+                duplicates.add(key)
+            else:
+                seen.add(key)
+        return duplicates
+
     def _write_result_column(self, result_col_idx, keys, values, start_row):
         to_remove = []
         for merged in self.target_ws.merged_cells.ranges:
@@ -235,6 +246,15 @@ class ExcelMatcher:
             return False, self.errors
 
         target_keys, start_row, end_row = self._extract_target_keys()
+
+        # 检查目标键唯一性（若不允许重复）
+        if not self.allow_duplicate_keys:
+            duplicates = self._check_duplicate_target_keys(target_keys)
+            if duplicates:
+                dup_examples = [f"'{k}'" for k in list(duplicates)[:5]]
+                self.errors.append(f"目标文件键列存在重复值: {', '.join(dup_examples)}。如需继续填充，请勾选“允许目标键重复”。")
+                return False, self.errors
+
         lookup, match_len = self._build_lookup_dict()
         used_target_keys = [key[:match_len] for key in target_keys]
 

@@ -7,6 +7,7 @@ from core.exceptions import ValidationError
 from core.response import make_response
 from services.convert.service import ConvertService
 from core.task.decorator import async_task
+from core.file_naming import generate_output_filename
 
 logger = logging.getLogger(__name__)
 convert_bp = Blueprint('convert', __name__, url_prefix='/convert', template_folder='../templates/convert')
@@ -68,4 +69,7 @@ def download(task_id):
     if not path or not os.path.exists(path):
         return make_response(False, None, '文件不存在', 404)
     basename = os.path.basename(path)
-    return send_file(path, as_attachment=True, download_name=basename)
+    # 统一命名：convert_原始文件名_转换结果.扩展名
+    original = data.get('original_filename', 'file')
+    safe_name = generate_output_filename('convert', original, suffix='_转换结果')
+    return send_file(path, as_attachment=True, download_name=safe_name)

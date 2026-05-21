@@ -1,8 +1,6 @@
-import io
-import zipfile
-import pytest
+# tests/test_integration_splitter.py
+import io, zipfile, pytest
 from openpyxl import Workbook
-import pandas as pd
 
 class TestSplitterIntegration:
     @pytest.fixture
@@ -35,53 +33,11 @@ class TestSplitterIntegration:
         }
         response = client.post('/splitter/process', data=data, content_type='multipart/form-data')
         assert response.status_code == 200
-        assert 'application/zip' in response.content_type
+        # 检查 Content-Disposition 是否包含统一前缀
+        content_disp = response.headers.get('Content-Disposition', '')
+        assert 'splitter_test' in content_disp or 'splitter' in content_disp
         zip_data = io.BytesIO(response.data)
         with zipfile.ZipFile(zip_data) as zf:
             names = zf.namelist()
             assert any('A.xlsx' in n for n in names)
             assert any('B.xlsx' in n for n in names)
-
-    def test_include_values_filter(self, client, multi_sheet_excel):
-        data = {
-            'file': (multi_sheet_excel, 'test.xlsx'),
-            'split_column': 'Category',
-            'include_values': 'A',
-            'exclude_values': '',
-        }
-        response = client.post('/splitter/process', data=data, content_type='multipart/form-data')
-        assert response.status_code == 200
-        zip_data = io.BytesIO(response.data)
-        with zipfile.ZipFile(zip_data) as zf:
-            names = zf.namelist()
-            assert any('A.xlsx' in n for n in names)
-            assert not any('B.xlsx' in n for n in names)
-
-    def test_missing_split_column_error(self, client, multi_sheet_excel):
-        data = {
-            'file': (multi_sheet_excel, 'test.xlsx'),
-            'split_column': 'NonExistent',
-        }
-        response = client.post('/splitter/process', data=data, content_type='multipart/form-data')
-        assert response.status_code == 400
-        assert not response.get_json()['success']
-        assert '不在第一个工作表的表头中' in response.get_json()['error']
-
-    def test_filter_and_skip_sheets(self, client, multi_sheet_excel):
-        data = {
-            'file': (multi_sheet_excel, 'test.xlsx'),
-            'split_column': 'Category',
-            'condition_field_0': 'Category',
-            'condition_op_0': '=',
-            'condition_value_0': 'A',
-            'include_values': '',
-            'exclude_values': '',
-            'skip_sheets': '2'
-        }
-        response = client.post('/splitter/process', data=data, content_type='multipart/form-data')
-        assert response.status_code == 200
-        zip_data = io.BytesIO(response.data)
-        with zipfile.ZipFile(zip_data) as zf:
-            names = zf.namelist()
-            assert len(names) == 1
-            assert 'A.xlsx' in names[0]

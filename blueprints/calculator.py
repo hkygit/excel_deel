@@ -6,16 +6,16 @@ from flask import Blueprint, render_template, request, send_file, current_app, a
 from services import FileService, ComputeEngine
 from core.decorators import handle_exceptions
 from core.response import error_response
+from core.file_naming import generate_output_filename
+from core.header_detection import detect_header_start
 from services.excel.calculator_processor import ColumnCalculatorProcessor, AggregateBackfillProcessor
 
 logger = logging.getLogger(__name__)
 calc_bp = Blueprint('calc', __name__, url_prefix='/calc', template_folder='../templates/calculator')
 
-
 @calc_bp.route('/')
 def index():
     return render_template('calculator/index.html')
-
 
 @calc_bp.route('/process', methods=['POST'])
 @handle_exceptions()
@@ -35,14 +35,23 @@ def process():
         file_service.cleanup([filepath])
         return error_response('无效的操作类型', 400)
 
-    # 表头行号解析
-    header_row_str = request.form.get('header_row', '1').strip()
-    try:
-        header_row = int(header_row_str)
-        if header_row < 1:
-            raise ValueError
-    except ValueError:
-        return error_response('表头行号必须为正整数', 400)
+    # 表头行号：如果用户未填写，自动检测
+    header_row_str = request.form.get('header_row', '').strip()
+    if header_row_str:
+        try:
+            header_row = int(header_row_str)
+            if header_row < 1:
+                raise ValueError
+        except ValueError:
+            return error_response('表头行号必须为正整数', 400)
+    else:
+        try:
+            data_start = detect_header_start(filepath)
+            header_row = data_start - 1  # header_row 是表头行号（1-based），数据从下一行开始
+            if header_row < 1:
+                header_row = 1
+        except Exception:
+            header_row = 1  # 回退
 
     result_path = None
     try:
@@ -102,4 +111,5 @@ def process():
             logger.warning(f"清理临时文件失败: {e}")
         return response
 
-    return send_file(result_path, as_attachment=True, download_name=os.path.basename(result_path))
+    download_name = generate_output_filename('calc', file.filename, suffix='_计算结果')
+    return send_file(result_path, as_attachment=True, download_name=download_name)
