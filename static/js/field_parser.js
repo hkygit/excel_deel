@@ -67,9 +67,10 @@
             }
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);
+            const filename = getFilenameFromContentDisposition(resp.headers.get('Content-Disposition')) || '字段映射结果.xlsx';
             const a = document.createElement('a');
             a.href = url;
-            a.download = '字段映射结果.xlsx';
+            a.download = filename;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);

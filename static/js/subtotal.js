@@ -64,11 +64,12 @@
                 pollTask(taskId, submitBtn);
             } else {
                 // 同步下载
-                const blob = await resp.blob();
+                    const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
+                const filename = getFilenameFromContentDisposition(resp.headers.get('Content-Disposition')) || 'subtotal_result.xlsx';
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = 'subtotal_result.xlsx';
+                a.download = filename;
                 document.body.appendChild(a);
                 a.click();
                 a.remove();

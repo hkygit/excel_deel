@@ -24,9 +24,10 @@ document.addEventListener('DOMContentLoaded', function() {
             }
             const blob = await response.blob();
             const url = window.URL.createObjectURL(blob);
+            const filename = getFilenameFromContentDisposition(response.headers.get('Content-Disposition')) || '转置结果.xlsx';
             const a = document.createElement('a');
             a.href = url;
-            a.download = '转置结果.xlsx';
+            a.download = filename;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);

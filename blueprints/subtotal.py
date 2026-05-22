@@ -8,7 +8,7 @@ from core.exceptions import ValidationError
 from core.task.decorator import async_task
 from services.subtotal.engine import SubtotalEngine, _build_header_map, resolve_single_col
 from core.csv_utils import split_fields
-from core.file_naming import generate_output_filename
+from core.file_naming import generate_output_filename, build_content_disposition
 
 logger = logging.getLogger(__name__)
 subtotal_bp = Blueprint('subtotal', __name__, url_prefix='/subtotal',
@@ -135,10 +135,12 @@ def process():
                 original_filename=original_filename
             )
             out_path = engine.process()
-            # 同步下载使用引擎生成的路径中的文件名（已含统一前缀）
-            return send_file(out_path, as_attachment=True,
-                             download_name=os.path.basename(out_path),
+            download_name = generate_output_filename('subtotal', original_filename, suffix='_小计')
+            resp = send_file(out_path, as_attachment=True,
+                             download_name=download_name,
                              mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            resp.headers['Content-Disposition'] = build_content_disposition(download_name)
+            return resp
         finally:
             file_service.cleanup([path])
 
@@ -165,4 +167,6 @@ def download(task_id):
     # 使用统一命名函数生成下载名
     original_filename = data.get('original_filename', 'data.xlsx')
     download_name = generate_output_filename('subtotal', original_filename, suffix='_小计')
-    return send_file(path, as_attachment=True, download_name=download_name)
+    resp = send_file(path, as_attachment=True, download_name=download_name)
+    resp.headers['Content-Disposition'] = build_content_disposition(download_name)
+    return resp
