@@ -59,6 +59,7 @@ def process():
     key_map_b = [k.strip() for k in key_map_b_str.split(',') if k.strip()] if key_map_b_str else key_map_a
     compare_map = json.loads(request.form['compare_map'])
     filters_a = json.loads(request.form.get('filters_a','[]'))
+    filters_b = json.loads(request.form.get('filters_b','[]'))
     dup_action = request.form.get('duplicate_action','error')
 
     app = current_app._get_current_object()
@@ -75,7 +76,7 @@ def process():
             service = CheckerService(
                 files_a=saved_a, files_b=saved_b,
                 key_map_a=key_map_a, key_map_b=key_map_b,
-                compare_map=compare_map, filters_a=filters_a,
+                compare_map=compare_map, filters_a=filters_a, filters_b=filters_b,
                 duplicate_action=dup_action, config=cfg,
                 progress_callback=progress_cb,
                 precheck_data=pre_data

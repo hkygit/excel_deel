@@ -16,7 +16,7 @@ class CheckerService(ProgressTask):
     """文件校验服务（策略上下文）"""
     def __init__(self, files_a=None, files_b=None,
                  key_map_a=None, key_map_b=None,
-                 compare_map=None, filters_a=None,
+                 compare_map=None, filters_a=None, filters_b=None,
                  duplicate_action=None, config=None,
                  progress_callback=None,
                  precheck_data=None):
@@ -27,6 +27,7 @@ class CheckerService(ProgressTask):
         self.key_map_b = key_map_b or []
         self.compare_map = compare_map or []
         self.filters_a = filters_a or []
+        self.filters_b = filters_b or []
         self.config = config
         self.duplicate_action = duplicate_action or (config.duplicate_action if config else "error")
         self.precheck_data = precheck_data
@@ -61,6 +62,7 @@ class CheckerService(ProgressTask):
             key_map_b=self.key_map_b,
             compare_map=self.compare_map,
             filters_a=self.filters_a,
+            filters_b=self.filters_b,
             duplicate_action=self.duplicate_action,
             config=self.config,
             progress_callback=self.progress_callback,

@@ -20,7 +20,7 @@ BATCH_SIZE = 10000
 class BaseCheckerStrategy(ProgressTask):
     """校验策略基类"""
     def __init__(self, files_a, files_b, key_map_a, key_map_b,
-                 compare_map, filters_a, duplicate_action, config,
+                 compare_map, filters_a, filters_b, duplicate_action, config,
                  progress_callback=None, precheck_data=None):
         super().__init__(progress_callback)
         self.files_a = files_a or []
@@ -29,12 +29,20 @@ class BaseCheckerStrategy(ProgressTask):
         self.key_map_b = key_map_b or []
         self.compare_map = compare_map or []
         self.filters_a = filters_a or []
+        self.filters_b = filters_b or []
         self.config = config
         self.duplicate_action = duplicate_action or (config.duplicate_action if config else "error")
         self.precheck_data = precheck_data
 
     def _make_key(self, row, key_cols):
-        return tuple(str(row[k]) for k in key_cols)
+        values = []
+        for k in key_cols:
+            try:
+                value = row[k]
+            except Exception:
+                value = row.get(k) if isinstance(row, dict) else None
+            values.append(value)
+        return tuple(values)
 
 
 class MemoryCheckerStrategy(BaseCheckerStrategy):
@@ -102,6 +110,9 @@ class MemoryCheckerStrategy(BaseCheckerStrategy):
         needed_b = set(self.key_map_b)
         for m in self.compare_map:
             needed_b.add(m["compare"])
+        for f in self.filters_b:
+            if "field" in f:
+                needed_b.add(f["field"])
         needed_b.discard("")
 
         batch_buffer = []
@@ -109,7 +120,7 @@ class MemoryCheckerStrategy(BaseCheckerStrategy):
         cmp_only_rows = []
 
         for file in self.files_b:
-            for row in StreamReader.read_excel(file, list(needed_b)):
+            for row in StreamReader.read_excel(file, list(needed_b), self.filters_b):
                 batch_buffer.append(row)
                 processed_b += 1
                 if len(batch_buffer) >= BATCH_SIZE:
@@ -167,7 +178,11 @@ class MemoryCheckerStrategy(BaseCheckerStrategy):
 
         diff_mask = pd.Series(False, index=merged.index)
         for ca, cb in zip(cmp_cols_a, cmp_cols_b):
-            diff_mask |= (merged[f'{ca}_标准'] != merged[f'{cb}_比较'])
+            left = merged[f'{ca}_标准']
+            right = merged[f'{cb}_比较']
+            eq = left.eq(right)
+            both_null = left.isna() & right.isna()
+            diff_mask |= ~(eq.fillna(False) | both_null)
         diff_rows = merged[diff_mask]
 
         if not diff_rows.empty:
@@ -218,11 +233,12 @@ class SqliteCheckerStrategy(BaseCheckerStrategy):
             self.set_progress(0, "导入标准群...")
             self._import_files(db, "std", self.files_a, list(needed_a), self.filters_a)
             self.set_progress(50, "导入比较群...")
-            self._import_files(db, "cmp", self.files_b, list(needed_b), None)
+            self._import_files(db, "cmp", self.files_b, list(needed_b), self.filters_b)
 
             if self.duplicate_action == "error":
                 for tbl, keys, label in [("std", self.key_map_a, "标准"), ("cmp", self.key_map_b, "比较")]:
-                    sql = f"SELECT {','.join(keys)} FROM {tbl} GROUP BY {','.join(keys)} HAVING COUNT(*)>1"
+                    quoted_keys = ",".join([f'"{k}"' for k in keys])
+                    sql = f"SELECT {quoted_keys} FROM {tbl} GROUP BY {quoted_keys} HAVING COUNT(*)>1"
                     if db.execute(sql).fetchone():
                         raise ValidationError(f"{label}群主键重复")
             else:
@@ -231,11 +247,16 @@ class SqliteCheckerStrategy(BaseCheckerStrategy):
 
             cmp_a = [m["standard"] for m in self.compare_map]
             cmp_b = [m["compare"] for m in self.compare_map]
-            join_on = " AND ".join([f"std.{ka}=cmp.{kb}" for ka, kb in zip(self.key_map_a, self.key_map_b)])
-            eq_parts = [f'TRIM(LOWER(std.{ca})) = TRIM(LOWER(cmp.{cb}))' for ca, cb in zip(cmp_a, cmp_b)]
-            diff_sql = f"SELECT std.*,cmp.* FROM std JOIN cmp ON {join_on} WHERE NOT ({' AND '.join(eq_parts)})"
-            only_a_sql = f"SELECT std.* FROM std LEFT JOIN cmp ON {join_on} WHERE cmp.{self.key_map_b[0]} IS NULL"
-            only_b_sql = f"SELECT cmp.* FROM cmp LEFT JOIN std ON {join_on} WHERE std.{self.key_map_a[0]} IS NULL"
+            quoted_std_keys = [f'std."{ka}"' for ka in self.key_map_a]
+            quoted_cmp_keys = [f'cmp."{kb}"' for kb in self.key_map_b]
+            join_on = " AND ".join([f"{a} = {b}" for a, b in zip(quoted_std_keys, quoted_cmp_keys)])
+            eq_parts = [
+                f'((std."{ca}" = cmp."{cb}") OR (std."{ca}" IS NULL AND cmp."{cb}" IS NULL))'
+                for ca, cb in zip(cmp_a, cmp_b)
+            ]
+            diff_sql = f"SELECT std.*, cmp.* FROM std JOIN cmp ON {join_on} WHERE NOT ({' AND '.join(eq_parts)})"
+            only_a_sql = f"SELECT std.* FROM std LEFT JOIN cmp ON {join_on} WHERE cmp.\"{self.key_map_b[0]}\" IS NULL"
+            only_b_sql = f"SELECT cmp.* FROM cmp LEFT JOIN std ON {join_on} WHERE std.\"{self.key_map_a[0]}\" IS NULL"
 
             self.set_progress(80, "执行对比查询...")
             diff_df = db.fetch_df(diff_sql)

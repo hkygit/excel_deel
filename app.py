@@ -113,12 +113,14 @@ def create_app():
 
     return app
 
+app = create_app()
+
 if __name__ == '__main__':
-    app = create_app()
     from waitress import serve
     try:
-        logger.info("启动服务...")
-        serve(app, host='0.0.0.0', port=5000,
+        port = int(os.environ.get('PORT', 5000))
+        logger.info(f"启动服务...端口 {port}")
+        serve(app, host='0.0.0.0', port=port,
               max_request_body_size=2*1024*1024*1024,
               channel_timeout=3600, connection_limit=100,
               clear_untrusted_proxy_headers=True, _quiet=False)

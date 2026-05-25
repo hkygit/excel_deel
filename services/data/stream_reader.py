@@ -35,15 +35,19 @@ class StreamReader:
             for col in columns:
                 if col in col_indices:
                     val = row[col_indices[col]]
-                    d[col] = str(val).strip().lower() if val is not None else ''
+                    if isinstance(val, str):
+                        val = val.strip()
+                    d[col] = val
                 else:
-                    d[col] = ''
+                    d[col] = None
             if filter_conditions:
                 prepared = d.copy()
                 for f in filters:
                     if f.get('op') in ('>','<','>=','<='):
-                        try: prepared[f['field']] = float(prepared[f['field']])
-                        except: pass
+                        try:
+                            prepared[f['field']] = float(prepared[f['field']])
+                        except Exception:
+                            pass
                 if not ConditionFilter.apply_to_dict(prepared, filter_conditions):
                     processed += 1
                     if progress_callback:
