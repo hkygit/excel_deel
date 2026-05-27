@@ -1,146 +1,289 @@
 #!/usr/bin/env python3
 """
-静态检查：验证所有生成 Excel 的蓝图是否使用了统一的文件命名函数
+一键生成各模块的 POML 配置文件（.txt），存放于 POML/ 目录下。
+每个配置文件包含该模块运行所需的所有相关文件（核心、蓝图、服务、测试、前端等）。
 """
+
 import os
-import ast
-import sys
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-BLUEPRINTS_DIR = os.path.join(ROOT, 'blueprints')
+# ========== 定义各模块的配置文件内容 ==========
+CONFIGS = {
+    "calc.txt": """# calc模块相关文件
+blueprints/calculator.py
+services/excel/calculator_processor.py
+services/excel/compute_engine.py
+services/excel/aggregator.py
+services/data/reader.py
+services/data/writer.py
+services/data/formatter.py
+services/data/file_service.py
+core/expression_engine.py
+core/excel_utils.py
+core/data_access_layer.py
+core/header_detection.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/csv_utils.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/calculator/index.html
+templates/base.html
+static/css/style.css
+static/js/main.js
+tests/test_calculator.py
+tests/test_integration_calculator.py
+""",
 
-# 需要检查的蓝图模块及其功能描述（文件名 -> 描述）
-TARGET_MODULES = {
-    'calculator.py': '列计算/聚合回填',
-    'comparator.py': '文件对比',
-    'matcher.py': '匹配填充',
-    'summarizer.py': '汇总工具',
-    'splitter.py': '文件拆分',
-    'subtotal.py': '数据小计',
-    'field_parser.py': '字段映射导出',
-    'checker.py': '文件校验下载',
-    'convert.py': '格式转换下载',
-    'team_report.py': '车队日报下载',
-    'transposer.py': '行列转置',
+    "compare.txt": """# compare模块相关文件
+blueprints/comparator.py
+services/excel/comparator.py
+services/data/file_service.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/exceptions.py
+core/config.py
+core/di.py
+schemas/comparator.py
+templates/comparator/index.html
+templates/base.html
+static/css/style.css
+static/js/main.js
+tests/test_comparator.py
+tests/test_integration_comparator.py
+""",
+
+    "match.txt": """# match模块相关文件
+blueprints/matcher.py
+services/excel/matcher.py
+services/data/reader.py
+core/excel_utils.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/csv_utils.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/matcher/index.html
+templates/debug.html
+templates/base.html
+static/css/style.css
+static/js/main.js
+tests/test_integration_matcher.py
+""",
+
+    "summary.txt": """# summary模块相关文件
+blueprints/summarizer.py
+services/excel/compute_engine.py
+services/excel/aggregator.py
+services/data/reader.py
+services/data/writer.py
+services/data/formatter.py
+services/data/file_service.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/csv_utils.py
+core/header_detection.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/summarizer/index.html
+templates/base.html
+static/css/style.css
+static/js/main.js
+tests/test_integration_summarizer.py
+""",
+
+    "splitter.txt": """# splitter模块相关文件
+blueprints/splitter.py
+core/filter_engine.py
+core/validators.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/splitter/index.html
+templates/base.html
+static/css/style.css
+static/js/main.js
+tests/test_splitter.py
+tests/test_integration_splitter.py
+""",
+
+    "field_parser.txt": """# field_parser模块相关文件
+blueprints/field_parser.py
+services/field_parser/service.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/csv_utils.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/field_parser/index.html
+templates/base.html
+static/css/style.css
+static/js/field_parser.js
+static/js/main.js
+tests/test_field_parser.py
+tests/test_integration_field_parser.py
+""",
+
+    "checker.txt": """# checker模块相关文件
+blueprints/checker.py
+services/checker/__init__.py
+services/checker/service.py
+services/checker/strategies.py
+services/checker/constants.py
+services/data/stream_reader.py
+services/data/row_counter.py
+services/data/report_writer.py
+core/filter_engine.py
+core/progress_task.py
+core/sqlite_buffer.py
+core/task/__init__.py
+core/task/base.py
+core/task/decorator.py
+core/task/manager.py
+core/task/state.py
+core/task/storage.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/checker/index.html
+templates/base.html
+static/css/checker.css
+static/css/style.css
+static/js/checker.js
+static/js/main.js
+tests/test_checker_service.py
+tests/test_integration_checker.py
+""",
+
+    "convert.txt": """# convert模块相关文件
+blueprints/convert.py
+services/convert/__init__.py
+services/convert/service.py
+core/task/__init__.py
+core/task/base.py
+core/task/decorator.py
+core/task/manager.py
+core/task/state.py
+core/task/storage.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/convert/index.html
+templates/base.html
+static/css/style.css
+static/js/convert.js
+static/js/main.js
+tests/test_convert_service.py
+tests/test_integration_convert.py
+""",
+
+    "team_report.txt": """# team_report模块相关文件
+blueprints/team_report.py
+services/team_report/__init__.py
+services/team_report/service.py
+services/team_report/writer.py
+services/common/excel_styles.py
+core/task/__init__.py
+core/task/base.py
+core/task/decorator.py
+core/task/manager.py
+core/task/state.py
+core/task/storage.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/team_report/index.html
+templates/base.html
+static/css/style.css
+static/js/team_report.js
+static/js/main.js
+tests/test_team_report_service.py
+tests/test_integration_team_report.py
+tests/test_team_report_long_running.py
+""",
+
+    "transposer.txt": """# transposer模块相关文件
+blueprints/transposer.py
+services/transposer/service.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/csv_utils.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/transposer/index.html
+templates/base.html
+static/css/style.css
+static/js/transposer.js
+static/js/main.js
+tests/test_transposer.py
+""",
+
+    "subtotal.txt": """# subtotal模块相关文件
+blueprints/subtotal.py
+services/subtotal/__init__.py
+services/subtotal/engine.py
+core/header_detection.py
+core/csv_utils.py
+core/task/__init__.py
+core/task/base.py
+core/task/decorator.py
+core/task/manager.py
+core/task/state.py
+core/task/storage.py
+core/response.py
+core/decorators.py
+core/file_naming.py
+core/exceptions.py
+core/config.py
+core/di.py
+templates/subtotal/index.html
+templates/base.html
+static/css/style.css
+static/js/subtotal.js
+static/js/main.js
+tests/test_subtotal_engine.py
+tests/test_integration_subtotal.py
+""",
 }
 
-def check_import(node):
-    """检查 AST 中是否导入了 generate_output_filename"""
-    for n in ast.walk(node):
-        if isinstance(n, ast.ImportFrom):
-            if n.module == 'core.file_naming':
-                for alias in n.names:
-                    if alias.name == 'generate_output_filename':
-                        return True
-    return False
-
-def check_usage_in_function(node, func_name):
-    """检查指定函数内是否调用了 generate_output_filename"""
-    for n in ast.walk(node):
-        if isinstance(n, ast.FunctionDef) and n.name == func_name:
-            # 遍历函数体中的调用
-            for sub in ast.walk(n):
-                if isinstance(sub, ast.Call):
-                    # 直接调用 generate_output_filename(...)
-                    if isinstance(sub.func, ast.Name) and sub.func.id == 'generate_output_filename':
-                        return True, '直接调用'
-                    # 从模块调用，如 core.file_naming.generate_output_filename
-                    if isinstance(sub.func, ast.Attribute):
-                        if sub.func.attr == 'generate_output_filename':
-                            # 检查是否赋值给了 download_name
-                            return True, '模块调用'
-            # 如果没有找到，可能是在 send_file 的 download_name 中使用
-            for sub in ast.walk(n):
-                if isinstance(sub, ast.keyword) and sub.arg == 'download_name':
-                    if isinstance(sub.value, ast.Call) and isinstance(sub.value.func, ast.Name) and sub.value.func.id == 'generate_output_filename':
-                        return True, 'download_name参数'
-                    if isinstance(sub.value, ast.Call) and isinstance(sub.value.func, ast.Attribute) and sub.value.func.attr == 'generate_output_filename':
-                        return True, 'download_name参数'
-            return False, ''
-    return False, ''
-
-def check_module(filepath):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-    try:
-        tree = ast.parse(content)
-    except SyntaxError as e:
-        return {'imported': False, 'used': False, 'error': str(e)}
-
-    imported = check_import(tree)
-
-    # 查找可能的下载函数：通常为 download、export、或者直接返回 send_file 的视图函数
-    used = False
-    detail = ''
-    # 检查所有函数
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            # 常见的下载/导出函数名
-            if node.name in ('download', 'export', 'convert', 'process', 'generate', 'debug'):
-                # 在这些函数中查找是否有 generate_output_filename 的使用
-                # 遍历函数体中的 send_file 调用
-                for sub in ast.walk(node):
-                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == 'send_file':
-                        # 检查 download_name 参数
-                        for kw in sub.keywords:
-                            if kw.arg == 'download_name':
-                                if isinstance(kw.value, ast.Call):
-                                    if isinstance(kw.value.func, ast.Name) and kw.value.func.id == 'generate_output_filename':
-                                        used = True
-                                        detail = f'在函数 {node.name} 的 download_name 中使用'
-                                break
-                if not used:
-                    # 也可能是先调用 generate_output_filename 再作为变量传给 send_file
-                    for sub in ast.walk(node):
-                        if isinstance(sub, ast.Assign):
-                            for target in sub.targets:
-                                if isinstance(target, ast.Name):
-                                    if isinstance(sub.value, ast.Call) and isinstance(sub.value.func, ast.Name) and sub.value.func.id == 'generate_output_filename':
-                                        used = True
-                                        detail = f'在函数 {node.name} 中赋值给变量 {target.id}'
-    return {'imported': imported, 'used': used, 'detail': detail}
-
 def main():
-    print("=" * 60)
-    print("统一文件命名静态检查")
-    print("=" * 60)
-    results = {}
-    for filename, desc in TARGET_MODULES.items():
-        filepath = os.path.join(BLUEPRINTS_DIR, filename)
-        if not os.path.exists(filepath):
-            results[filename] = {'desc': desc, 'status': '文件不存在'}
-            continue
-        check_result = check_module(filepath)
-        results[filename] = {**check_result, 'desc': desc}
+    # 获取项目根目录（脚本所在目录）
+    base_dir = Path(__file__).resolve().parent
+    poml_dir = base_dir / "POML"
+    poml_dir.mkdir(exist_ok=True)
+    print(f"✓ POML 目录已创建/确认: {poml_dir}")
 
-    # 输出表格
-    print(f"{'模块':<20} {'功能':<16} {'导入':<6} {'使用':<6} {'详情'}")
-    print("-" * 70)
-    for fname, info in results.items():
-        if 'status' in info:
-            print(f"{fname:<20} {info['desc']:<16} {'❌':<6} {'❌':<6} {info['status']}")
-        else:
-            imp = '✅' if info['imported'] else '❌'
-            use = '✅' if info['used'] else '❌'
-            detail = info.get('detail', '')
-            print(f"{fname:<20} {info['desc']:<16} {imp:<6} {use:<6} {detail}")
+    for filename, content in CONFIGS.items():
+        filepath = poml_dir / filename
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"✓ 已生成: {filepath}")
 
-    print("\n总结：")
-    all_ok = all(
-        'status' not in info and info.get('imported') and info.get('used')
-        for info in results.values()
-    )
-    if all_ok:
-        print("✅ 所有模块均已导入并使用统一命名函数。")
-    else:
-        print("⚠️ 以下模块需要修复：")
-        for fname, info in results.items():
-            if 'status' in info:
-                print(f"  - {fname}: {info['status']}")
-            elif not info.get('imported'):
-                print(f"  - {fname}: 未导入 generate_output_filename")
-            elif not info.get('used'):
-                print(f"  - {fname}: 未在下载/导出中使用 generate_output_filename")
+    print("\n✅ 所有模块配置文件已生成完毕。")
+    print("现在可以运行 python 整合git喂给ai.py 并选择选项 2，输入对应的 .txt 文件名来导出模块代码快照。")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

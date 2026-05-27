@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-一键导出 Git 仓库中未被 .gitignore 忽略的代码文件为 Markdown（供 AI 分析）
-交互版：运行后选择导出范围（整个仓库 / 模块 / 目录），自动生成对应快照。
-
-用法：
-    python 整合git喂给ai.py              # 交互模式
-    python 整合git喂给ai.py --help       # 查看命令行参数（仍支持非交互运行）
+一键导出 Git 仓库中未被 .gitignore 忽略的代码文件为 POML (Project Object Markup Language)
+支持模式：
+1. 整个仓库（全量导出）
+2. 根据配置文件导出（从 POML 目录读取文件列表，每行一个文件或目录，支持 # 注释）
 """
 
 import subprocess
@@ -15,7 +13,6 @@ from pathlib import Path
 
 # ---------------------- 可自定义常量 ----------------------
 TEXT_EXTENSIONS = {
-    # 后端
     ".py", ".pyw", ".pyx", ".pxd", ".pxi",
     ".java", ".kt", ".kts",
     ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx", ".inl",
@@ -28,21 +25,20 @@ TEXT_EXTENSIONS = {
     ".r", ".R", ".Rmd",
     ".scala", ".clj", ".cljs", ".cljc", ".edn",
     ".lua", ".tcl",
-    # 前端 & 标记模板
     ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx",
     ".vue", ".svelte", ".astro",
     ".html", ".htm", ".xhtml",
     ".css", ".scss", ".sass", ".less", ".styl",
     ".xml", ".xsl", ".xslt", ".svg",
-    # 配置 / 数据 / 文档
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties",
     ".env", ".env.example", ".editorconfig", ".gitignore", ".gitattributes",
     ".md", ".markdown", ".rst", ".txt", ".csv", ".tsv",
     ".sql", ".graphql", ".gql", ".proto", ".avsc",
 }
-MAX_FILE_BYTES = 500 * 1024  # 500 KB
-OUTPUT_FILENAME_BASE = "project_code_for_ai"  # 基础文件名，实际输出加模块后缀
-# --------------------------------------------------------
+MAX_FILE_BYTES = 500 * 1024          # 500 KB
+POML_DIR = "POML"                    # 输出根目录下的文件夹名
+OUTPUT_FILENAME_FULL = "full_repository.md"
+# ----------------------------------------------------------
 
 def find_repo_root(start: Path) -> Path:
     """向上查找包含 .git 的目录"""
@@ -58,7 +54,7 @@ def find_repo_root(start: Path) -> Path:
     sys.exit(1)
 
 def run_git_ls_files(repo_root: Path) -> list[str]:
-    """调用 git ls-files 返回所有未被忽略的文件"""
+    """调用 git ls-files 返回所有未被忽略的文件（已跟踪或未跟踪但未忽略）"""
     try:
         result = subprocess.run(
             ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
@@ -77,7 +73,6 @@ def run_git_ls_files(repo_root: Path) -> list[str]:
         sys.exit(1)
 
 def is_text_extension(filename: str) -> bool:
-    """通过文件名 / 扩展名判断是否为代码 / 文本文件"""
     name = os.path.basename(filename).lower()
     if name in {
         "makefile", "dockerfile", "jenkinsfile", "vagrantfile",
@@ -92,7 +87,6 @@ def is_text_extension(filename: str) -> bool:
     return ext in TEXT_EXTENSIONS
 
 def is_likely_binary(filepath: Path) -> bool:
-    """读取文件前 1024 字节，若含 null 字节则为二进制"""
     try:
         with open(filepath, "rb") as f:
             chunk = f.read(1024)
@@ -101,7 +95,6 @@ def is_likely_binary(filepath: Path) -> bool:
         return True
 
 def read_text_safe(filepath: Path, max_bytes: int) -> str | None:
-    """安全读取文本文件，超过大小或错误则返回 None"""
     try:
         size = filepath.stat().st_size
         if size > max_bytes:
@@ -112,7 +105,6 @@ def read_text_safe(filepath: Path, max_bytes: int) -> str | None:
         return None
 
 def get_lang_hint(filename: str) -> str:
-    """返回适用于 Markdown 代码块的语言标识"""
     ext = os.path.splitext(filename)[1].lower()
     mapping = {
         ".py": "python", ".pyw": "python",
@@ -130,43 +122,59 @@ def get_lang_hint(filename: str) -> str:
     }
     return mapping.get(ext, "")
 
-def sanitize_module_name(module: str) -> str:
-    """将模块路径转为安全的文件名片段"""
-    safe = module.strip("/\\").replace("/", "_").replace("\\", "_")
-    return safe if safe else "full"
+def expand_paths(rel_paths: list[str], all_tracked_files: list[str]) -> list[str]:
+    """
+    将路径列表（可能包含目录）展开为实际文件列表。
+    - 文件：直接加入
+    - 目录：找出所有以该目录开头的文件（前缀匹配）
+    """
+    result = set()
+    for p in rel_paths:
+        p = p.strip("/\\")
+        if not p:
+            continue
+        if p in all_tracked_files:
+            result.add(p)
+        else:
+            prefix = p + "/"
+            matched = [f for f in all_tracked_files if f.startswith(prefix)]
+            if matched:
+                result.update(matched)
+            else:
+                print(f"⚠️ 警告: 路径不存在或不在 Git 跟踪中，已忽略: {p}", file=sys.stderr)
+    return sorted(result)
 
-def filter_files(files: list[str], module_filter: str | None) -> tuple[list[str], str | None]:
-    """根据过滤条件筛选文件列表，返回 (过滤后文件列表, 模块字符串用于命名)"""
-    if module_filter is None:
-        return files, None
+def load_config_file(config_name: str, repo_root: Path) -> list[str]:
+    """读取配置文件（位于 POML_DIR 目录下），返回非空、非注释的行列表"""
+    config_path = repo_root / POML_DIR / config_name
+    if not config_path.exists():
+        print(f"错误: 配置文件不存在: {config_path}", file=sys.stderr)
+        sys.exit(1)
+    lines = []
+    with open(config_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lines.append(line)
+    return lines
 
-    module_filter = module_filter.strip().replace("\\", "/")
-    if not module_filter:
-        return files, None
-
-    prefix = module_filter if module_filter.endswith("/") else module_filter + "/"
-    filtered = []
-    for f in files:
-        if f == module_filter or f.startswith(prefix):
-            filtered.append(f)
-    return filtered, module_filter
-
-def export_to_markdown(repo_root: Path, files: list[str], module_str: str | None):
-    """执行导出操作"""
-    # 构建输出文件名
-    if module_str:
-        suffix = sanitize_module_name(module_str)
-        output_name = f"{OUTPUT_FILENAME_BASE}_{suffix}.md"
-    else:
-        output_name = f"{OUTPUT_FILENAME_BASE}.md"
-    output_path = repo_root / output_name
+def export_poml(repo_root: Path, files: list[str], output_name: str):
+    """
+    导出为 POML 格式（结构化 Markdown 列表）
+    output_name: 输出文件名（不含路径），将保存在 POML_DIR 下
+    """
+    out_dir = repo_root / POML_DIR
+    out_dir.mkdir(exist_ok=True)
+    output_path = out_dir / output_name
 
     count = 0
     with open(output_path, "w", encoding="utf-8") as md:
-        md.write(f"# 项目代码快照\n\n")
-        md.write(f"仓库: {repo_root.name}\n")
-        md.write(f"过滤条件: {module_str if module_str else '全部'}\n")
-        md.write(f"匹配文件数: {len(files)}\n\n---\n\n")
+        md.write(f"# Project Object Markup Language (POML)\n\n")
+        md.write(f"- **repository**: `{repo_root.name}`\n")
+        md.write(f"- **export_filter**: `{output_name.replace('.md', '')}`\n")
+        md.write(f"- **total_files**: {len(files)}\n\n")
+        md.write(f"## Files\n\n")
 
         for rel_path in files:
             abs_path = repo_root / rel_path
@@ -180,13 +188,15 @@ def export_to_markdown(repo_root: Path, files: list[str], module_str: str | None
             if content is None:
                 continue
             count += 1
-            md.write(f"## {rel_path}\n\n")
             lang = get_lang_hint(rel_path)
-            md.write(f"```{lang}\n")
+            md.write(f"- **{rel_path}**\n")
+            md.write(f"  - language: `{lang}`\n")
+            md.write(f"  - content:\n")
+            md.write(f"    ```{lang}\n")
             md.write(content)
             if not content.endswith("\n"):
                 md.write("\n")
-            md.write("```\n\n")
+            md.write(f"    ```\n\n")
 
         md.write(f"\n> ✅ 共导出 {count} 个代码文件。\n")
 
@@ -194,35 +204,36 @@ def export_to_markdown(repo_root: Path, files: list[str], module_str: str | None
 
 def interactive_mode(repo_root: Path, all_files: list[str]):
     """交互式选择导出范围"""
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("📦 请选择导出范围：")
-    print("  1. 整个仓库")
-    print("  2. 指定模块")
-    print("  3. 指定目录")
-    print("=" * 50)
-    choice = input("请输入数字 (1/2/3): ").strip()
+    print("  1. 整个仓库（全量导出）")
+    print("  2. 根据配置文件导出（从 POML 目录读取文件列表）")
+    print("=" * 60)
+    choice = input("请输入数字 (1/2): ").strip()
 
     if choice == "1":
-        module_filter = None
-    elif choice in ("2", "3"):
-        filt_type = "模块" if choice == "2" else "目录"
-        example = "services/checker" if choice == "2" else "blueprints"
-        path = input(f"请输入要导出的{filt_type}路径（相对于仓库根目录，例如 {example}）: ").strip()
-        if not path:
-            print("路径不能为空，已取消导出。")
+        print(f"📂 匹配到 {len(all_files)} 个文件，开始导出...")
+        export_poml(repo_root, all_files, OUTPUT_FILENAME_FULL)
+    elif choice == "2":
+        config_name = input("请输入配置文件名（位于 POML/ 目录下，如 checker.txt）: ").strip()
+        if not config_name:
+            print("文件名不能为空，已取消导出。")
             sys.exit(0)
-        module_filter = path
+        rel_paths = load_config_file(config_name, repo_root)
+        if not rel_paths:
+            print("配置文件为空或无有效行，已取消导出。")
+            sys.exit(0)
+        target_files = expand_paths(rel_paths, all_files)
+        if not target_files:
+            print("未找到任何有效文件，请检查配置文件中的路径是否正确。")
+            sys.exit(0)
+        print(f"📂 配置文件指定了 {len(rel_paths)} 个条目，展开后得到 {len(target_files)} 个文件。")
+        base_name = os.path.splitext(config_name)[0]
+        output_name = f"{base_name}.md"
+        export_poml(repo_root, target_files, output_name)
     else:
-        print("无效的选择，请输入 1、2 或 3。")
+        print("无效的选择，请输入 1 或 2。")
         sys.exit(1)
-
-    filtered_files, module_str = filter_files(all_files, module_filter)
-    if not filtered_files:
-        print(f"警告：在指定条件下未找到任何文件。")
-        sys.exit(0)
-
-    print(f"📂 匹配到 {len(filtered_files)} 个文件，开始导出...")
-    export_to_markdown(repo_root, filtered_files, module_str)
 
 def main():
     script_dir = Path(__file__).resolve().parent
@@ -232,20 +243,15 @@ def main():
     all_files = run_git_ls_files(repo_root)
     print(f"📄 仓库未忽略文件总数: {len(all_files)}")
 
-    # 如果提供了命令行参数，则保持非交互模式（兼容自动化）
+    # 命令行参数兼容
     if len(sys.argv) > 1:
-        # 处理可能的 --help
         if sys.argv[1] in ("-h", "--help"):
-            print("用法: python 整合git喂给ai.py [模块路径]")
-            print("      无参数时进入交互模式。")
+            print("用法: python 整合git喂给ai.py           # 交互模式")
+            print("       python 整合git喂给ai.py --help  # 显示帮助")
             sys.exit(0)
-        module_filter = sys.argv[1].strip()
-        filtered_files, module_str = filter_files(all_files, module_filter)
-        if not filtered_files:
-            print(f"警告：在 '{module_filter}' 下未找到任何文件。")
-            sys.exit(0)
-        print(f"📂 命令行过滤 '{module_filter}'，匹配 {len(filtered_files)} 个文件。")
-        export_to_markdown(repo_root, filtered_files, module_str)
+        else:
+            print("警告：命令行直接指定模块的功能已移除，请使用交互模式。")
+            interactive_mode(repo_root, all_files)
     else:
         interactive_mode(repo_root, all_files)
 
