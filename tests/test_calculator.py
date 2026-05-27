@@ -4,6 +4,7 @@ from services.excel.calculator import ColumnCalculator
 from services.excel.aggregator import Aggregator
 from core.excel_utils import ExcelFile
 
+
 class TestColumnCalculator:
     def test_calculate_column(self, tmp_path):
         wb = Workbook()
@@ -17,10 +18,12 @@ class TestColumnCalculator:
         ws['B3'] = 3
         test_file = tmp_path / 'test.xlsx'
         wb.save(test_file)
+
         with ExcelFile(test_file) as ef:
             calculator = ColumnCalculator(ef)
             calculator.calculate_column('A+B', 'C', merge_by_cols=None)
             ef.save(test_file)
+
         result_df = pd.read_excel(test_file)
         assert result_df.loc[0, 'Result'] == 30
         assert result_df.loc[1, 'Result'] == 8
@@ -39,14 +42,17 @@ class TestColumnCalculator:
         ws['B4'] = 5
         test_file = tmp_path / 'test.xlsx'
         wb.save(test_file)
+
         with ExcelFile(test_file) as ef:
             calculator = ColumnCalculator(ef)
             calculator.calculate_column('B*2', 'C', merge_by_cols=['A'])
             ef.save(test_file)
+
         result_df = pd.read_excel(test_file)
         assert result_df.loc[0, 'Result'] == 20
         assert pd.isna(result_df.loc[1, 'Result'])
         assert result_df.loc[2, 'Result'] == 10
+
 
 class TestAggregator:
     def test_aggregate_sum(self):

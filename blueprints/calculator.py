@@ -1,9 +1,7 @@
 # blueprints/calculator.py
 import os
 import logging
-import tempfile
-import pandas as pd
-from flask import Blueprint, render_template, request, send_file, current_app, after_this_request
+from flask import Blueprint, render_template, request, send_file, current_app
 from openpyxl.utils.exceptions import InvalidFileException
 
 from services import FileService, ComputeEngine
@@ -12,31 +10,33 @@ from core.response import error_response
 from core.file_naming import generate_output_filename
 from core.header_detection import detect_header_start
 from core.exceptions import ValidationError
+from core.excel_helpers import normalize_excel_file
 from services.excel.calculator_processor import ColumnCalculatorProcessor, AggregateBackfillProcessor
-
 
 logger = logging.getLogger(__name__)
 calc_bp = Blueprint('calc', __name__, url_prefix='/calc', template_folder='../templates/calculator')
 
-def convert_xls_to_xlsx(filepath):
-    """将 .xls 文件转换为 .xlsx，返回新文件路径（临时文件）"""
-    # 读取原始 .xls 文件
+
+def ensure_excel_compatible(filepath: str, file_service) -> (str, str):
+    """
+    确保文件可以被后续处理（openpyxl 和 pandas）正常读取。
+    返回 (规范化的文件路径, 临时文件标记)
+    总是转换为临时文件，避免原始文件被重复转换。
+    """
     try:
-        df = pd.read_excel(filepath, sheet_name=None, dtype=str)
-        # 创建临时 .xlsx 文件
-        fd, new_path = tempfile.mkstemp(suffix='.xlsx')
-        os.close(fd)
-        with pd.ExcelWriter(new_path, engine='openpyxl') as writer:
-            for sheet_name, data in df.items():
-                data.to_excel(writer, sheet_name=sheet_name, index=False)
-        logger.info(f"已将 .xls 文件转换为 .xlsx: {new_path}")
-        return new_path
+        normalized_path = normalize_excel_file(filepath)
     except Exception as e:
-        raise ValidationError(f"无法转换 .xls 文件: {str(e)}")
+        file_service.cleanup([filepath])
+        raise ValidationError(f"Excel 文件处理失败: {str(e)}。请确保文件是有效的 Excel 文件且未损坏。")
+    # 删除原始上传文件
+    file_service.cleanup([filepath])
+    return normalized_path, normalized_path
+
 
 @calc_bp.route('/')
 def index():
     return render_template('calculator/index.html')
+
 
 @calc_bp.route('/process', methods=['POST'])
 @handle_exceptions()
@@ -57,41 +57,35 @@ def process():
 
     # 保存原始上传文件
     filepath = file_service.save_upload(file)
-    converted = False
-    # 如果是 .xls 文件，自动转换为 .xlsx
-    if ext == '.xls':
-        try:
-            new_path = convert_xls_to_xlsx(filepath)
-            # 删除原始 .xls 文件，使用新文件
-            file_service.cleanup([filepath])
-            filepath = new_path
-            converted = True
-        except Exception as e:
-            file_service.cleanup([filepath])
-            raise ValidationError(f"旧版 Excel 文件转换失败: {str(e)}")
+    temp_processed = None
+
+    # 确保文件兼容，总是转换为临时文件
+    filepath, temp_processed = ensure_excel_compatible(filepath, file_service)
 
     calc_type = request.form.get('calc_type')
     if calc_type not in ('column', 'aggregate'):
         file_service.cleanup([filepath])
+        if temp_processed:
+            file_service.cleanup([temp_processed])
         return error_response('无效的操作类型', 400)
 
-    # 表头行号
+    # 表头行号：支持 header_row=0 表示无表头
     header_row_str = request.form.get('header_row', '').strip()
     if header_row_str:
         try:
             header_row = int(header_row_str)
-            if header_row < 1:
+            if header_row < 0:
                 raise ValueError
         except ValueError:
-            return error_response('表头行号必须为正整数', 400)
+            return error_response('表头行号必须为非负整数', 400)
     else:
         try:
             data_start = detect_header_start(filepath)
             header_row = data_start - 1
-            if header_row < 1:
-                header_row = 1
+            if header_row < 0:
+                header_row = 0
         except Exception:
-            header_row = 1
+            header_row = 0
 
     result_path = None
     try:
@@ -138,21 +132,23 @@ def process():
 
     except InvalidFileException as e:
         file_service.cleanup([filepath])
+        if temp_processed:
+            file_service.cleanup([temp_processed])
         raise ValidationError(f"文件格式错误，无法打开: {str(e)}。请确保文件是有效的 Excel 文件（.xlsx/.xls）且未被损坏。")
     except Exception as e:
         file_service.cleanup([filepath])
-        raise e
+        if temp_processed:
+            file_service.cleanup([temp_processed])
+        raise
 
-    @after_this_request
-    def cleanup_files(response):
-        try:
-            if filepath and os.path.exists(filepath):
-                os.remove(filepath)
-            if result_path and os.path.exists(result_path):
-                os.remove(result_path)
-        except Exception as e:
-            logger.warning(f"清理临时文件失败: {e}")
-        return response
+    # 清理临时文件（不删除最终结果）
+    try:
+        if temp_processed and os.path.exists(temp_processed):
+            os.remove(temp_processed)
+        if filepath and os.path.exists(filepath) and filepath != temp_processed:
+            os.remove(filepath)
+    except Exception as e:
+        logger.warning(f"清理临时文件失败: {e}")
 
     download_name = generate_output_filename('calc', original_filename, suffix='_计算结果')
     return send_file(result_path, as_attachment=True, download_name=download_name)

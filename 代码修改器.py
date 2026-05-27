@@ -1,289 +1,153 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-一键生成各模块的 POML 配置文件（.txt），存放于 POML/ 目录下。
-每个配置文件包含该模块运行所需的所有相关文件（核心、蓝图、服务、测试、前端等）。
+最终修复：使用 openpyxl 的 data_only=True 模式重新保存文件，避免公式求值错误。
 """
 
 import os
-from pathlib import Path
+import tempfile
+import logging
+from openpyxl import load_workbook
 
-# ========== 定义各模块的配置文件内容 ==========
-CONFIGS = {
-    "calc.txt": """# calc模块相关文件
-blueprints/calculator.py
-services/excel/calculator_processor.py
-services/excel/compute_engine.py
-services/excel/aggregator.py
-services/data/reader.py
-services/data/writer.py
-services/data/formatter.py
-services/data/file_service.py
-core/expression_engine.py
-core/excel_utils.py
-core/data_access_layer.py
-core/header_detection.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/csv_utils.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/calculator/index.html
-templates/base.html
-static/css/style.css
-static/js/main.js
-tests/test_calculator.py
-tests/test_integration_calculator.py
-""",
+logger = logging.getLogger(__name__)
 
-    "compare.txt": """# compare模块相关文件
-blueprints/comparator.py
-services/excel/comparator.py
-services/data/file_service.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/exceptions.py
-core/config.py
-core/di.py
-schemas/comparator.py
-templates/comparator/index.html
-templates/base.html
-static/css/style.css
-static/js/main.js
-tests/test_comparator.py
-tests/test_integration_comparator.py
-""",
+# 只修改 core/excel_helpers.py 中的 normalize_excel_file 函数
+NEW_EXCEL_HELPERS = '''# core/excel_helpers.py
+"""Excel 操作公共工具函数"""
+import re
+import logging
+from typing import List, Tuple, Optional, Dict, Any
+import openpyxl
+import os
+import tempfile
+import pandas as pd
+import numpy as np
 
-    "match.txt": """# match模块相关文件
-blueprints/matcher.py
-services/excel/matcher.py
-services/data/reader.py
-core/excel_utils.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/csv_utils.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/matcher/index.html
-templates/debug.html
-templates/base.html
-static/css/style.css
-static/js/main.js
-tests/test_integration_matcher.py
-""",
+logger = logging.getLogger(__name__)
 
-    "summary.txt": """# summary模块相关文件
-blueprints/summarizer.py
-services/excel/compute_engine.py
-services/excel/aggregator.py
-services/data/reader.py
-services/data/writer.py
-services/data/formatter.py
-services/data/file_service.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/csv_utils.py
-core/header_detection.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/summarizer/index.html
-templates/base.html
-static/css/style.css
-static/js/main.js
-tests/test_integration_summarizer.py
-""",
+def safe_get_cell_value(ws, row: int, col: int) -> Any:
+    """安全获取单元格值，支持合并单元格"""
+    cell = ws.cell(row, col)
+    if isinstance(cell, openpyxl.cell.cell.MergedCell):
+        for merged_range in ws.merged_cells.ranges:
+            if (merged_range.min_row <= row <= merged_range.max_row and
+                merged_range.min_col <= col <= merged_range.max_col):
+                return ws.cell(merged_range.min_row, merged_range.min_col).value
+    return cell.value
 
-    "splitter.txt": """# splitter模块相关文件
-blueprints/splitter.py
-core/filter_engine.py
-core/validators.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/splitter/index.html
-templates/base.html
-static/css/style.css
-static/js/main.js
-tests/test_splitter.py
-tests/test_integration_splitter.py
-""",
 
-    "field_parser.txt": """# field_parser模块相关文件
-blueprints/field_parser.py
-services/field_parser/service.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/csv_utils.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/field_parser/index.html
-templates/base.html
-static/css/style.css
-static/js/field_parser.js
-static/js/main.js
-tests/test_field_parser.py
-tests/test_integration_field_parser.py
-""",
+def safe_write_cell(ws, row: int, col: int, value: Any) -> None:
+    """安全写入单元格值，若单元格属于合并区域则先拆分"""
+    cell = ws.cell(row, col)
+    if isinstance(cell, openpyxl.cell.cell.MergedCell):
+        to_unmerge = []
+        for merged_range in ws.merged_cells.ranges:
+            if (merged_range.min_row <= row <= merged_range.max_row and
+                merged_range.min_col <= col <= merged_range.max_col):
+                to_unmerge.append(str(merged_range))
+        for rng in to_unmerge:
+            ws.unmerge_cells(rng)
+    ws.cell(row, col).value = value
 
-    "checker.txt": """# checker模块相关文件
-blueprints/checker.py
-services/checker/__init__.py
-services/checker/service.py
-services/checker/strategies.py
-services/checker/constants.py
-services/data/stream_reader.py
-services/data/row_counter.py
-services/data/report_writer.py
-core/filter_engine.py
-core/progress_task.py
-core/sqlite_buffer.py
-core/task/__init__.py
-core/task/base.py
-core/task/decorator.py
-core/task/manager.py
-core/task/state.py
-core/task/storage.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/checker/index.html
-templates/base.html
-static/css/checker.css
-static/css/style.css
-static/js/checker.js
-static/js/main.js
-tests/test_checker_service.py
-tests/test_integration_checker.py
-""",
 
-    "convert.txt": """# convert模块相关文件
-blueprints/convert.py
-services/convert/__init__.py
-services/convert/service.py
-core/task/__init__.py
-core/task/base.py
-core/task/decorator.py
-core/task/manager.py
-core/task/state.py
-core/task/storage.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/convert/index.html
-templates/base.html
-static/css/style.css
-static/js/convert.js
-static/js/main.js
-tests/test_convert_service.py
-tests/test_integration_convert.py
-""",
+def clear_merges_in_column(ws, col_idx: int) -> None:
+    """清除某一列上的所有合并单元格"""
+    to_remove = []
+    for merged in ws.merged_cells.ranges:
+        if merged.min_col <= col_idx <= merged.max_col:
+            to_remove.append(merged)
+    for merged in to_remove:
+        ws.unmerge_cells(str(merged))
 
-    "team_report.txt": """# team_report模块相关文件
-blueprints/team_report.py
-services/team_report/__init__.py
-services/team_report/service.py
-services/team_report/writer.py
-services/common/excel_styles.py
-core/task/__init__.py
-core/task/base.py
-core/task/decorator.py
-core/task/manager.py
-core/task/state.py
-core/task/storage.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/team_report/index.html
-templates/base.html
-static/css/style.css
-static/js/team_report.js
-static/js/main.js
-tests/test_team_report_service.py
-tests/test_integration_team_report.py
-tests/test_team_report_long_running.py
-""",
 
-    "transposer.txt": """# transposer模块相关文件
-blueprints/transposer.py
-services/transposer/service.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/csv_utils.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/transposer/index.html
-templates/base.html
-static/css/style.css
-static/js/transposer.js
-static/js/main.js
-tests/test_transposer.py
-""",
+def build_column_name_mapping(ws, header_row: int) -> Dict[str, int]:
+    """
+    构建列名到列索引的映射，正确处理合并单元格。
+    :return: {列名: 列索引}
+    """
+    name_to_idx = {}
+    for col_idx in range(1, ws.max_column + 1):
+        cell = ws.cell(header_row, col_idx)
+        if isinstance(cell, openpyxl.cell.cell.MergedCell):
+            for merged in ws.merged_cells.ranges:
+                if (merged.min_row <= header_row <= merged.max_row and
+                    merged.min_col <= col_idx <= merged.max_col):
+                    cell = ws.cell(merged.min_row, merged.min_col)
+                    break
+        if cell.value is not None:
+            name = str(cell.value).strip()
+            if name:
+                name_to_idx[name] = col_idx
+    return name_to_idx
 
-    "subtotal.txt": """# subtotal模块相关文件
-blueprints/subtotal.py
-services/subtotal/__init__.py
-services/subtotal/engine.py
-core/header_detection.py
-core/csv_utils.py
-core/task/__init__.py
-core/task/base.py
-core/task/decorator.py
-core/task/manager.py
-core/task/state.py
-core/task/storage.py
-core/response.py
-core/decorators.py
-core/file_naming.py
-core/exceptions.py
-core/config.py
-core/di.py
-templates/subtotal/index.html
-templates/base.html
-static/css/style.css
-static/js/subtotal.js
-static/js/main.js
-tests/test_subtotal_engine.py
-tests/test_integration_subtotal.py
-""",
-}
+
+def normalize_excel_file(filepath: str) -> str:
+    """
+    将任何 Excel 文件转换为标准 .xlsx 临时文件，使用 openpyxl 的 data_only 模式，
+    确保公式被计算为值，避免后续读取时出错。
+    返回新的临时文件路径，调用者负责清理。
+    """
+    # 优先使用 openpyxl 读取（data_only=True）
+    try:
+        # 使用 data_only=True 加载工作簿，读取公式计算后的值
+        wb = load_workbook(filepath, data_only=True, keep_vba=False)
+        fd, temp_xlsx = tempfile.mkstemp(suffix='.xlsx')
+        os.close(fd)
+        wb.save(temp_xlsx)
+        wb.close()
+        logger.info(f"使用 openpyxl(data_only) 成功转换为标准格式: {temp_xlsx}")
+        return temp_xlsx
+    except Exception as e:
+        logger.warning(f"openpyxl 转换失败: {e}，回退到 pandas 方式")
+        # 回退：使用 pandas 以字符串类型读取（可能会遇到公式问题，但作为最后手段）
+        try:
+            sheets = pd.read_excel(filepath, sheet_name=None, dtype=str, engine='openpyxl')
+            if not sheets:
+                raise ValueError("文件无工作表")
+            fd, temp_xlsx = tempfile.mkstemp(suffix='.xlsx')
+            os.close(fd)
+            with pd.ExcelWriter(temp_xlsx, engine='openpyxl') as writer:
+                for sheet_name, df in sheets.items():
+                    if df.empty:
+                        pd.DataFrame().to_excel(writer, sheet_name=sheet_name, index=False)
+                    else:
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+            logger.info(f"使用 pandas 成功转换为标准格式: {temp_xlsx}")
+            return temp_xlsx
+        except Exception as e2:
+            raise ValueError(f"无法读取或转换 Excel 文件: {str(e2)}")
+
+
+def safe_cleanup_dataframe(df: pd.DataFrame, auto_convert_numeric: bool = True) -> pd.DataFrame:
+    """
+    安全清洗 DataFrame：
+    - 去除字符串首尾空格，将空字符串转为 NaN。
+    - 可选：如果某列所有非空值都能转换为数值，则转换为数值。
+    """
+    df = df.copy()
+    for col in df.select_dtypes(include=['object']).columns:
+        df[col] = df[col].fillna('').astype(str).str.strip()
+        df[col] = df[col].replace(r'^\s*$', None, regex=True)
+
+        if auto_convert_numeric:
+            non_null = df[col].dropna()
+            if len(non_null) > 0:
+                try:
+                    pd.to_numeric(non_null, errors='raise')
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    logger.debug(f"列 '{col}' 已自动转换为数值类型")
+                except (ValueError, TypeError):
+                    pass
+    return df
+'''
 
 def main():
-    # 获取项目根目录（脚本所在目录）
-    base_dir = Path(__file__).resolve().parent
-    poml_dir = base_dir / "POML"
-    poml_dir.mkdir(exist_ok=True)
-    print(f"✓ POML 目录已创建/确认: {poml_dir}")
-
-    for filename, content in CONFIGS.items():
-        filepath = poml_dir / filename
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
-        print(f"✓ 已生成: {filepath}")
-
-    print("\n✅ 所有模块配置文件已生成完毕。")
-    print("现在可以运行 python 整合git喂给ai.py 并选择选项 2，输入对应的 .txt 文件名来导出模块代码快照。")
+    # 目标文件路径
+    target = "core/excel_helpers.py"
+    with open(target, 'w', encoding='utf-8') as f:
+        f.write(NEW_EXCEL_HELPERS.lstrip())
+    print(f"已更新: {target}")
+    print("修复完成。现在优先使用 openpyxl data_only 模式转换文件，避免公式求值错误。")
 
 if __name__ == "__main__":
     main()

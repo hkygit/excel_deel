@@ -1,11 +1,13 @@
 import io
 from openpyxl import load_workbook
 
+
 class TestCalculatorIntegration:
     def test_column_calculation(self, client, sample_excel_file):
         data = {
             'file': (sample_excel_file, 'test.xlsx'),
             'calc_type': 'column',
+            'header_row': '1',
             'expression': 'A+B',
             'result_col_column': 'D',
             'merge_by_cols': ''
@@ -23,6 +25,7 @@ class TestCalculatorIntegration:
         data = {
             'file': (sample_excel_file, 'test.xlsx'),
             'calc_type': 'aggregate',
+            'header_row': '1',
             'group_cols': 'A',
             'agg_cols': 'B',
             'agg_func': 'sum',
@@ -46,6 +49,7 @@ class TestCalculatorIntegration:
         data = {
             'file': (sample_excel_file, 'test.xlsx'),
             'calc_type': 'column',
+            'header_row': '1',
             'expression': '',
             'result_col_column': 'D'
         }

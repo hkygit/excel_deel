@@ -18,9 +18,16 @@ _OPERATORS = {
     ast.USub: operator.neg,
 }
 
+
 def extract_column_letters(expr: str) -> Set[str]:
-    """从表达式中提取大写列字母"""
-    return set(re.findall(r'[A-Z]+', expr.upper()))
+    """
+    从表达式中提取列字母（仅限 1-3 位大写字母）。
+    使用简单正则 [A-Z]+，并过滤长度 >3 的 token（避免匹配函数名）。
+    """
+    tokens = re.findall(r'[A-Z]+', expr.upper())
+    # 只保留长度 1-3 的 token（列字母通常不超过 3 位）
+    return {t for t in tokens if 1 <= len(t) <= 3}
+
 
 class ExpressionEngine:
     def __init__(self, missing_value_strategy: str = 'nan'):
@@ -107,7 +114,9 @@ class ExpressionEngine:
             raise ValueError("缺少必要变量或值无效")
         return np.nan
 
+
 _default_engine = ExpressionEngine()
+
 
 def get_expression_engine() -> ExpressionEngine:
     return _default_engine

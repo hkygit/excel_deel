@@ -1,17 +1,10 @@
 # core/data_access_layer.py
-"""
-统一数据访问层 (核心基础设施)
-- 封装文件读写，自动类型推断与清理
-- 可插拔的读取器/写入器
-"""
-
+"""统一数据访问层 (核心基础设施)"""
 import logging
 from typing import Optional, Dict, Any
 import pandas as pd
 import numpy as np
-
-from services.data.reader import DataReader
-from services.data.writer import DataWriter
+from core.excel_helpers import safe_cleanup_dataframe
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +12,9 @@ logger = logging.getLogger(__name__)
 class DataAccessLayer:
     """统一数据访问层"""
 
-    def __init__(self, reader: Optional[DataReader] = None, writer: Optional[DataWriter] = None):
+    def __init__(self, reader=None, writer=None):
+        from services.data.reader import DataReader
+        from services.data.writer import DataWriter
         self.reader = reader or DataReader()
         self.writer = writer or DataWriter()
         logger.debug("DataAccessLayer 初始化完成")
@@ -57,28 +52,29 @@ class DataAccessLayer:
 
     def _auto_clean_dataframe(self, df: pd.DataFrame,
                               dtype_hints: Optional[Dict[str, type]] = None) -> pd.DataFrame:
+        """
+        自动清洗 DataFrame：
+        - 首先应用 dtype_hints（如果提供），使用 pd.to_numeric 安全转换数值类型。
+        - 然后进行字符串清理和自动数值转换（保持向后兼容）。
+        """
         df = df.copy()
 
+        # 1. 应用 dtype_hints（优先，以满足测试期望）
         if dtype_hints:
             for col, dtype in dtype_hints.items():
-                if col in df.columns:
+                if col not in df.columns:
+                    continue
+                if dtype in (int, float, np.int64, np.float64):
+                    # 使用 pd.to_numeric 将无效值转为 NaN
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                else:
                     try:
                         df[col] = df[col].astype(dtype)
                     except Exception as e:
                         logger.warning(f"列 '{col}' 类型转换失败: {e}")
 
-        for col in df.select_dtypes(include=['object']).columns:
-            # 去除首尾空格
-            df[col] = df[col].astype(str).str.strip()
-            # 将空字符串替换为 NaN
-            df[col] = df[col].replace(r'^\s*$', np.nan, regex=True)
-
-            # 尝试转为数值
-            numeric_series = pd.to_numeric(df[col], errors='coerce')
-            # 如果存在至少一个有效数值，则将该列转换为数值类型
-            if numeric_series.notna().any():
-                df[col] = numeric_series
-                logger.debug(f"列 '{col}' 已自动转换为数值类型")
+        # 2. 通用清洗（字符串清理 + 自动数值转换）
+        df = safe_cleanup_dataframe(df, auto_convert_numeric=True)
 
         return df
 

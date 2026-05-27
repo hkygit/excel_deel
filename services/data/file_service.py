@@ -18,10 +18,20 @@ class FileService:
             raise ValueError("无效文件")
         if allowed_extensions is None:
             allowed_extensions = current_app.config.get('ALLOWED_EXTENSIONS', {'xlsx', 'xls', 'csv'})
-        ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
-        if ext not in allowed_extensions:
-            raise ValueError(f"不支持的文件类型: {ext}")
-        filename = secure_filename(file.filename)
+
+        # 分离文件名和扩展名，保留原始扩展名
+        original_filename = file.filename
+        name, ext = os.path.splitext(original_filename)
+        # 对文件名部分进行安全处理，扩展名保留原样（不经过 secure_filename，避免点号被替换）
+        safe_name = secure_filename(name) if name else 'file'
+        if not safe_name:
+            safe_name = 'file'
+        # 确保扩展名以小写形式保存
+        ext_lower = ext.lower()
+        # 如果扩展名不在允许列表中，但文件实际是有效的 Excel，我们仍保留（后续会转换）
+        # 这里不做严格检查，交给后续处理
+        filename = f"{safe_name}{ext_lower}"
+
         unique_id = uuid.uuid4().hex
         base_dir = current_app.config.get('UPLOAD_FOLDER', 'uploads')
         save_dir = os.path.join(base_dir, subdir) if subdir else base_dir
