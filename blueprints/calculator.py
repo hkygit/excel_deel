@@ -14,6 +14,7 @@ from core.header_detection import detect_header_start
 from core.exceptions import ValidationError
 from services.excel.calculator_processor import ColumnCalculatorProcessor, AggregateBackfillProcessor
 
+
 logger = logging.getLogger(__name__)
 calc_bp = Blueprint('calc', __name__, url_prefix='/calc', template_folder='../templates/calculator')
 
