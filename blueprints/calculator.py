@@ -17,20 +17,31 @@ logger = logging.getLogger(__name__)
 calc_bp = Blueprint('calc', __name__, url_prefix='/calc', template_folder='../templates/calculator')
 
 
+
+
 def ensure_excel_compatible(filepath: str, file_service) -> (str, str):
     """
     确保文件可以被后续处理（openpyxl 和 pandas）正常读取。
     返回 (规范化的文件路径, 临时文件标记)
-    总是转换为临时文件，避免原始文件被重复转换。
+
+    注意：不在这里删除任何文件，文件清理由调用者负责
     """
+    from core.excel_helpers import normalize_excel_file, safe_delete_file
+
+    normalized_path = None
     try:
         normalized_path = normalize_excel_file(filepath)
+        logger.info(f"文件规范化完成: {filepath} -> {normalized_path}")
+        return normalized_path, normalized_path
+
     except Exception as e:
-        file_service.cleanup([filepath])
+        logger.error(f"Excel 文件处理失败: {e}")
+        # 清理可能创建的文件
+        if normalized_path and os.path.exists(normalized_path) and normalized_path != filepath:
+            safe_delete_file(normalized_path)
         raise ValidationError(f"Excel 文件处理失败: {str(e)}。请确保文件是有效的 Excel 文件且未损坏。")
-    # 删除原始上传文件
-    file_service.cleanup([filepath])
-    return normalized_path, normalized_path
+
+
 
 
 @calc_bp.route('/')
@@ -143,10 +154,16 @@ def process():
 
     # 清理临时文件（不删除最终结果）
     try:
-        if temp_processed and os.path.exists(temp_processed):
-            os.remove(temp_processed)
-        if filepath and os.path.exists(filepath) and filepath != temp_processed:
-            os.remove(filepath)
+        from core.excel_helpers import safe_delete_file
+
+        # 清理处理器创建的临时文件
+        if temp_processed and os.path.exists(temp_processed) and temp_processed != result_path:
+            if safe_delete_file(temp_processed):
+                logger.info(f"已清理临时文件: {temp_processed}")
+
+        # 清理原始上传文件（由文件服务处理）
+        # 注意：这里不直接删除，由文件服务的清理机制处理
+
     except Exception as e:
         logger.warning(f"清理临时文件失败: {e}")
 

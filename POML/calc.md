@@ -13,9 +13,7 @@
 # blueprints/calculator.py
 import os
 import logging
-import tempfile
-import pandas as pd
-from flask import Blueprint, render_template, request, send_file, current_app, after_this_request
+from flask import Blueprint, render_template, request, send_file, current_app
 from openpyxl.utils.exceptions import InvalidFileException
 
 from services import FileService, ComputeEngine
@@ -24,30 +22,33 @@ from core.response import error_response
 from core.file_naming import generate_output_filename
 from core.header_detection import detect_header_start
 from core.exceptions import ValidationError
+from core.excel_helpers import normalize_excel_file
 from services.excel.calculator_processor import ColumnCalculatorProcessor, AggregateBackfillProcessor
 
 logger = logging.getLogger(__name__)
 calc_bp = Blueprint('calc', __name__, url_prefix='/calc', template_folder='../templates/calculator')
 
-def convert_xls_to_xlsx(filepath):
-    """将 .xls 文件转换为 .xlsx，返回新文件路径（临时文件）"""
-    # 读取原始 .xls 文件
+
+def ensure_excel_compatible(filepath: str, file_service) -> (str, str):
+    """
+    确保文件可以被后续处理（openpyxl 和 pandas）正常读取。
+    返回 (规范化的文件路径, 临时文件标记)
+    总是转换为临时文件，避免原始文件被重复转换。
+    """
     try:
-        df = pd.read_excel(filepath, sheet_name=None, dtype=str)
-        # 创建临时 .xlsx 文件
-        fd, new_path = tempfile.mkstemp(suffix='.xlsx')
-        os.close(fd)
-        with pd.ExcelWriter(new_path, engine='openpyxl') as writer:
-            for sheet_name, data in df.items():
-                data.to_excel(writer, sheet_name=sheet_name, index=False)
-        logger.info(f"已将 .xls 文件转换为 .xlsx: {new_path}")
-        return new_path
+        normalized_path = normalize_excel_file(filepath)
     except Exception as e:
-        raise ValidationError(f"无法转换 .xls 文件: {str(e)}")
+        file_service.cleanup([filepath])
+        raise ValidationError(f"Excel 文件处理失败: {str(e)}。请确保文件是有效的 Excel 文件且未损坏。")
+    # 删除原始上传文件
+    file_service.cleanup([filepath])
+    return normalized_path, normalized_path
+
 
 @calc_bp.route('/')
 def index():
     return render_template('calculator/index.html')
+
 
 @calc_bp.route('/process', methods=['POST'])
 @handle_exceptions()
@@ -68,41 +69,35 @@ def process():
 
     # 保存原始上传文件
     filepath = file_service.save_upload(file)
-    converted = False
-    # 如果是 .xls 文件，自动转换为 .xlsx
-    if ext == '.xls':
-        try:
-            new_path = convert_xls_to_xlsx(filepath)
-            # 删除原始 .xls 文件，使用新文件
-            file_service.cleanup([filepath])
-            filepath = new_path
-            converted = True
-        except Exception as e:
-            file_service.cleanup([filepath])
-            raise ValidationError(f"旧版 Excel 文件转换失败: {str(e)}")
+    temp_processed = None
+
+    # 确保文件兼容，总是转换为临时文件
+    filepath, temp_processed = ensure_excel_compatible(filepath, file_service)
 
     calc_type = request.form.get('calc_type')
     if calc_type not in ('column', 'aggregate'):
         file_service.cleanup([filepath])
+        if temp_processed:
+            file_service.cleanup([temp_processed])
         return error_response('无效的操作类型', 400)
 
-    # 表头行号
+    # 表头行号：支持 header_row=0 表示无表头
     header_row_str = request.form.get('header_row', '').strip()
     if header_row_str:
         try:
             header_row = int(header_row_str)
-            if header_row < 1:
+            if header_row < 0:
                 raise ValueError
         except ValueError:
-            return error_response('表头行号必须为正整数', 400)
+            return error_response('表头行号必须为非负整数', 400)
     else:
         try:
             data_start = detect_header_start(filepath)
             header_row = data_start - 1
-            if header_row < 1:
-                header_row = 1
+            if header_row < 0:
+                header_row = 0
         except Exception:
-            header_row = 1
+            header_row = 0
 
     result_path = None
     try:
@@ -149,21 +144,23 @@ def process():
 
     except InvalidFileException as e:
         file_service.cleanup([filepath])
+        if temp_processed:
+            file_service.cleanup([temp_processed])
         raise ValidationError(f"文件格式错误，无法打开: {str(e)}。请确保文件是有效的 Excel 文件（.xlsx/.xls）且未被损坏。")
     except Exception as e:
         file_service.cleanup([filepath])
-        raise e
+        if temp_processed:
+            file_service.cleanup([temp_processed])
+        raise
 
-    @after_this_request
-    def cleanup_files(response):
-        try:
-            if filepath and os.path.exists(filepath):
-                os.remove(filepath)
-            if result_path and os.path.exists(result_path):
-                os.remove(result_path)
-        except Exception as e:
-            logger.warning(f"清理临时文件失败: {e}")
-        return response
+    # 清理临时文件（不删除最终结果）
+    try:
+        if temp_processed and os.path.exists(temp_processed):
+            os.remove(temp_processed)
+        if filepath and os.path.exists(filepath) and filepath != temp_processed:
+            os.remove(filepath)
+    except Exception as e:
+        logger.warning(f"清理临时文件失败: {e}")
 
     download_name = generate_output_filename('calc', original_filename, suffix='_计算结果')
     return send_file(result_path, as_attachment=True, download_name=download_name)
@@ -298,19 +295,12 @@ def split_fields(s: str) -> List[str]:
   - content:
     ```python
 # core/data_access_layer.py
-"""
-统一数据访问层 (核心基础设施)
-- 封装文件读写，自动类型推断与清理
-- 可插拔的读取器/写入器
-"""
-
+"""统一数据访问层 (核心基础设施)"""
 import logging
 from typing import Optional, Dict, Any
 import pandas as pd
 import numpy as np
-
-from services.data.reader import DataReader
-from services.data.writer import DataWriter
+from core.excel_helpers import safe_cleanup_dataframe
 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +308,9 @@ logger = logging.getLogger(__name__)
 class DataAccessLayer:
     """统一数据访问层"""
 
-    def __init__(self, reader: Optional[DataReader] = None, writer: Optional[DataWriter] = None):
+    def __init__(self, reader=None, writer=None):
+        from services.data.reader import DataReader
+        from services.data.writer import DataWriter
         self.reader = reader or DataReader()
         self.writer = writer or DataWriter()
         logger.debug("DataAccessLayer 初始化完成")
@@ -356,28 +348,29 @@ class DataAccessLayer:
 
     def _auto_clean_dataframe(self, df: pd.DataFrame,
                               dtype_hints: Optional[Dict[str, type]] = None) -> pd.DataFrame:
+        """
+        自动清洗 DataFrame：
+        - 首先应用 dtype_hints（如果提供），使用 pd.to_numeric 安全转换数值类型。
+        - 然后进行字符串清理和自动数值转换（保持向后兼容）。
+        """
         df = df.copy()
 
+        # 1. 应用 dtype_hints（优先，以满足测试期望）
         if dtype_hints:
             for col, dtype in dtype_hints.items():
-                if col in df.columns:
+                if col not in df.columns:
+                    continue
+                if dtype in (int, float, np.int64, np.float64):
+                    # 使用 pd.to_numeric 将无效值转为 NaN
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                else:
                     try:
                         df[col] = df[col].astype(dtype)
                     except Exception as e:
                         logger.warning(f"列 '{col}' 类型转换失败: {e}")
 
-        for col in df.select_dtypes(include=['object']).columns:
-            # 去除首尾空格
-            df[col] = df[col].astype(str).str.strip()
-            # 将空字符串替换为 NaN
-            df[col] = df[col].replace(r'^\s*$', np.nan, regex=True)
-
-            # 尝试转为数值
-            numeric_series = pd.to_numeric(df[col], errors='coerce')
-            # 如果存在至少一个有效数值，则将该列转换为数值类型
-            if numeric_series.notna().any():
-                df[col] = numeric_series
-                logger.debug(f"列 '{col}' 已自动转换为数值类型")
+        # 2. 通用清洗（字符串清理 + 自动数值转换）
+        df = safe_cleanup_dataframe(df, auto_convert_numeric=True)
 
         return df
 
@@ -404,12 +397,13 @@ def get_data_access_layer() -> DataAccessLayer:
 # core/decorators.py
 import logging
 from functools import wraps
-from flask import jsonify, request
+from flask import jsonify
 from core.exceptions import AppException
 from core.response import make_response
 from openpyxl.utils.exceptions import InvalidFileException
 
 logger = logging.getLogger(__name__)
+
 
 def handle_exceptions():
     """统一异常处理装饰器：区分预期异常和未预期异常"""
@@ -422,7 +416,6 @@ def handle_exceptions():
                 logger.warning(f"业务异常: {e.message}")
                 return make_response(False, None, e.message, e.code)
             except (ValueError, InvalidFileException) as e:
-                # 预期内的参数/文件格式错误，返回具体消息
                 logger.warning(f"输入错误: {str(e)}")
                 return make_response(False, None, str(e), 400)
             except Exception as e:
@@ -712,9 +705,16 @@ _OPERATORS = {
     ast.USub: operator.neg,
 }
 
+
 def extract_column_letters(expr: str) -> Set[str]:
-    """从表达式中提取大写列字母"""
-    return set(re.findall(r'[A-Z]+', expr.upper()))
+    """
+    从表达式中提取列字母（仅限 1-3 位大写字母）。
+    使用简单正则 [A-Z]+，并过滤长度 >3 的 token（避免匹配函数名）。
+    """
+    tokens = re.findall(r'[A-Z]+', expr.upper())
+    # 只保留长度 1-3 的 token（列字母通常不超过 3 位）
+    return {t for t in tokens if 1 <= len(t) <= 3}
+
 
 class ExpressionEngine:
     def __init__(self, missing_value_strategy: str = 'nan'):
@@ -801,7 +801,9 @@ class ExpressionEngine:
             raise ValueError("缺少必要变量或值无效")
         return np.nan
 
+
 _default_engine = ExpressionEngine()
+
 
 def get_expression_engine() -> ExpressionEngine:
     return _default_engine
@@ -1149,10 +1151,20 @@ class FileService:
             raise ValueError("无效文件")
         if allowed_extensions is None:
             allowed_extensions = current_app.config.get('ALLOWED_EXTENSIONS', {'xlsx', 'xls', 'csv'})
-        ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
-        if ext not in allowed_extensions:
-            raise ValueError(f"不支持的文件类型: {ext}")
-        filename = secure_filename(file.filename)
+
+        # 分离文件名和扩展名，保留原始扩展名
+        original_filename = file.filename
+        name, ext = os.path.splitext(original_filename)
+        # 对文件名部分进行安全处理，扩展名保留原样（不经过 secure_filename，避免点号被替换）
+        safe_name = secure_filename(name) if name else 'file'
+        if not safe_name:
+            safe_name = 'file'
+        # 确保扩展名以小写形式保存
+        ext_lower = ext.lower()
+        # 如果扩展名不在允许列表中，但文件实际是有效的 Excel，我们仍保留（后续会转换）
+        # 这里不做严格检查，交给后续处理
+        filename = f"{safe_name}{ext_lower}"
+
         unique_id = uuid.uuid4().hex
         base_dir = current_app.config.get('UPLOAD_FOLDER', 'uploads')
         save_dir = os.path.join(base_dir, subdir) if subdir else base_dir
@@ -1439,268 +1451,250 @@ class AggregateCalculator:
   - language: `python`
   - content:
     ```python
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Excel 列计算与聚合回填处理器
-支持 .xls 文件自动转换为 .xlsx
-"""
-
+# services/excel/calculator_processor.py
+"""Excel 列计算与聚合回填处理器"""
 import os
 import gc
 import logging
-import tempfile
+import numpy as np
 import openpyxl
 import pandas as pd
-import re
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Optional, Tuple
+
 from core.excel_utils import ExcelFile, copy_merge_structure
 from core.data_access_layer import get_data_access_layer
 from core.csv_utils import build_column_mapping
+from core.excel_helpers import (
+    safe_get_cell_value, safe_write_cell, clear_merges_in_column,
+    build_column_name_mapping, normalize_excel_file, safe_cleanup_dataframe
+)
 from services.excel.compute_engine import ComputeEngine
 
 logger = logging.getLogger(__name__)
 
-def convert_xls_to_xlsx(filepath):
-    """将 .xls 文件转换为临时 .xlsx 文件"""
-    if not filepath.lower().endswith('.xls') or filepath.lower().endswith('.xlsx'):
-        return filepath
-    logger.info(f"正在将 .xls 文件转换为 .xlsx: {filepath}")
-    try:
-        # 使用 pandas 读取 .xls 并写入临时 .xlsx
-        df = pd.read_excel(filepath, sheet_name=None, dtype=str)
-        fd, temp_xlsx = tempfile.mkstemp(suffix='.xlsx')
-        os.close(fd)
-        with pd.ExcelWriter(temp_xlsx, engine='openpyxl') as writer:
-            for sheet_name, sheet_df in df.items():
-                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-        logger.info(f"转换成功: {temp_xlsx}")
-        return temp_xlsx
-    except Exception as e:
-        logger.error(f"转换 .xls 文件失败: {e}")
-        raise ValueError(f"无法转换 .xls 文件，请确保文件未损坏且可读: {e}")
 
-class ColumnCalculatorProcessor:
-    """列计算处理器（自动过滤结果列，支持 .xls）"""
-    def __init__(self, filepath, header_row, expression, result_col_input, merge_by_cols_str, compute_engine):
+class BaseExcelProcessor(ABC):
+    """Excel 处理器基类，封装公共的写入逻辑"""
+
+    def __init__(self, filepath: str, header_row: int, compute_engine: ComputeEngine):
         self.original_filepath = filepath
         self.header_row = header_row
-        self.original_expression = expression
-        self.result_col_input = result_col_input
-        self.merge_by_cols_str = merge_by_cols_str
         self.compute_engine = compute_engine
         self.dal = get_data_access_layer()
         self.temp_file = None
 
-    def _remove_result_column_from_expr(self, expression, result_col_letter):
-        """彻底从表达式中移除结果列字母"""
-        if not result_col_letter or result_col_letter not in expression:
-            return expression
-        pattern = r'(?:[+\-*/]?)' + re.escape(result_col_letter) + r'(?:[+\-*/]?)'
-        new_expr = re.sub(pattern, '', expression)
-        new_expr = re.sub(r'[+\-*/]{2,}', '', new_expr)
-        new_expr = re.sub(r'^[+\-*/]', '', new_expr)
-        new_expr = re.sub(r'[+\-*/]$', '', new_expr)
-        if new_expr != expression:
-            logger.warning(f"表达式中包含了结果列 {result_col_letter}，已自动移除: {expression} -> {new_expr}")
+    def _get_work_filepath(self) -> str:
+        """获取可写的工作文件路径，统一通过 normalize_excel_file 转换为临时 .xlsx"""
+        # 总是进行规范化，确保文件可读
+        self.temp_file = normalize_excel_file(self.original_filepath)
+        return self.temp_file
+
+    def _cleanup_temp(self):
+        if self.temp_file and os.path.exists(self.temp_file):
+            try:
+                os.unlink(self.temp_file)
+            except Exception as e:
+                logger.warning(f"清理临时文件失败: {e}")
+
+    def _resolve_result_column(self, ws, result_col_input: str) -> Tuple[int, str]:
+        """
+        解析结果列：支持列字母或列名。
+        返回 (列索引, 列名)
+        """
+        # 1. 尝试作为列字母解析
+        try:
+            col_idx = openpyxl.utils.column_index_from_string(result_col_input.upper())
+            header_cell = ws.cell(self.header_row, col_idx)
+            col_name = str(header_cell.value).strip() if header_cell.value else result_col_input
+            return col_idx, col_name
+        except Exception:
+            pass
+
+        # 2. 尝试作为列名查找
+        name_to_idx = build_column_name_mapping(ws, self.header_row)
+        if result_col_input in name_to_idx:
+            col_idx = name_to_idx[result_col_input]
+            return col_idx, result_col_input
+
+        # 3. 新列：追加到末尾
+        new_col_idx = ws.max_column + 1
+        ws.insert_cols(new_col_idx)
+        safe_write_cell(ws, self.header_row, new_col_idx, result_col_input)
+        return new_col_idx, result_col_input
+
+    def _write_result_column(self, ws, result_col_idx: int, values: List[Any],
+                             start_row: int, end_row: int) -> None:
+        """将计算结果写入指定列，并清理原有合并单元格"""
+        clear_merges_in_column(ws, result_col_idx)
+        for i, val in enumerate(values):
+            row = start_row + i
+            if isinstance(val, (np.integer, np.floating)):
+                val = val.item()
+            safe_write_cell(ws, row, result_col_idx, val)
+
+    def _copy_merge_structure(self, ws, src_col_letter: str, dst_col_idx: int,
+                              start_row: int, end_row: int) -> None:
+        """复制源列的合并结构到目标列"""
+        try:
+            src_col_idx = openpyxl.utils.column_index_from_string(src_col_letter)
+        except Exception:
+            return
+        copy_merge_structure(ws, src_col_idx, ws, dst_col_idx, start_row, end_row)
+
+    def _get_output_path(self) -> str:
+        """生成输出文件路径"""
+        base_name = os.path.splitext(os.path.basename(self.original_filepath))[0]
+        output_dir = os.path.dirname(self.original_filepath)
+        return os.path.join(output_dir, f"{base_name}_处理版.xlsx")
+
+    @abstractmethod
+    def process(self) -> str:
+        pass
+
+
+class ColumnCalculatorProcessor(BaseExcelProcessor):
+    """列计算处理器"""
+
+    def __init__(self, filepath: str, header_row: int, expression: str,
+                 result_col_input: str, merge_by_cols_str: str, compute_engine: ComputeEngine):
+        super().__init__(filepath, header_row, compute_engine)
+        self.expression = expression
+        self.result_col_input = result_col_input
+        self.merge_by_cols = [c.strip() for c in merge_by_cols_str.split(',') if c.strip()] if merge_by_cols_str else []
+
+    def _remove_result_column_from_expr(self, result_col_letter: str) -> str:
+        """从表达式中移除结果列字母（如果存在）"""
+        if not result_col_letter:
+            return self.expression
+        tokens = []
+        current = []
+        for ch in self.expression.upper():
+            if ch.isalpha():
+                current.append(ch)
+            else:
+                if current:
+                    tokens.append(''.join(current))
+                    current = []
+                tokens.append(ch)
+        if current:
+            tokens.append(''.join(current))
+
+        filtered = []
+        for token in tokens:
+            if token == result_col_letter:
+                continue
+            filtered.append(token)
+        new_expr = ''.join(filtered)
+        new_expr = new_expr.replace('+-', '-').replace('-+', '-').replace('++', '+').replace('--', '+')
+        new_expr = new_expr.lstrip('+-*/').rstrip('+-*/')
+        if new_expr != self.expression:
+            logger.warning(f"表达式中包含了结果列 {result_col_letter}，已自动移除: {self.expression} -> {new_expr}")
         return new_expr
 
-    def process(self):
-        # 0. 如果是 .xls 文件，先转换为临时 .xlsx
-        ext = os.path.splitext(self.original_filepath)[1].lower()
-        if ext == '.xls':
-            self.temp_file = convert_xls_to_xlsx(self.original_filepath)
-            filepath = self.temp_file
-        else:
-            filepath = self.original_filepath
-
+    def process(self) -> str:
+        filepath = self._get_work_filepath()
         try:
-            # 1. 读取 DataFrame 并获取列名
+            # 强制以字符串类型读取，避免公式错误
             df = pd.read_excel(filepath, header=self.header_row - 1, dtype=str)
-            df = self.dal._auto_clean_dataframe(df)
+            df = safe_cleanup_dataframe(df, auto_convert_numeric=True)
             headers = list(df.columns)
 
-            # 2. 构建列字母到列名的映射
             letter_to_name, name_to_letter = build_column_mapping(headers)
-            logger.debug(f"列字母映射: {letter_to_name}")
 
-            # 3. 获取结果列字母
-            result_col_letter = None
-            try:
-                col_idx = openpyxl.utils.column_index_from_string(self.result_col_input)
-                result_col_letter = openpyxl.utils.get_column_letter(col_idx)
-            except:
-                pass
-
-            # 4. 自动移除结果列字母
-            expression = self.original_expression
-            if result_col_letter:
-                expression = self._remove_result_column_from_expr(expression, result_col_letter)
-                if not expression.strip():
-                    raise ValueError(f"表达式在移除结果列 {result_col_letter} 后为空")
-
-            # 5. 提取并映射变量
-            variables = self.compute_engine.extract_variables(expression)
-            logger.info(f"表达式中的列字母: {variables}")
-            mapped_vars = {}
-            missing = []
-            for letter in variables:
-                if letter in letter_to_name:
-                    mapped_vars[letter] = letter_to_name[letter]
-                else:
-                    missing.append(letter)
-            if missing:
-                raise ValueError(f"表达式中的列字母 {missing} 无法映射到文件中的任何列（可用列字母: {list(letter_to_name.keys())}）")
-
-            # 6. 计算
-            def calc_row(row):
-                context = {letter: row[col_name] for letter, col_name in mapped_vars.items()}
-                return self.compute_engine.evaluate_expression(expression, context)
-            df["Result"] = df.apply(calc_row, axis=1)
-            logger.info("表达式计算完成")
-
-            # 7. 打开原始 Excel 写入（注意：如果是转换后的临时文件，原始文件无法写入，需要将结果写回原始文件？）
-            # 策略：如果原文件是 .xls，则最终输出新的 .xlsx 文件，保留在原文件同目录
-            if ext == '.xls':
-                # 原文件是 .xls，不能直接用 openpyxl 修改，我们直接基于转换后的临时文件写入结果，保存到新文件
-                output_base = os.path.splitext(os.path.basename(self.original_filepath))[0]
-                output_dir = os.path.dirname(self.original_filepath)
-                output_filename = f"{output_base}_处理版.xlsx"
-                result_path = os.path.join(output_dir, output_filename)
-                # 将计算结果写入临时文件并另存
-                with ExcelFile(filepath) as ef:
-                    ws = ef.active_sheet
-                    # 处理结果列...
-                    # 这里需要与下面逻辑类似，但为了避免重复，复用同一份代码块较复杂。
-                    # 鉴于时间，我们简单说明：可以调用一个通用写入函数。
-                    # 为了快速修复，我们假设原文件不是 .xls，但实际需要处理。这里提供完善方案。
-                    # 由于代码量较大，我将在下面统一写入代码块中处理两种情况。
-                pass
-
-            # 统一写入逻辑（适配原始文件和临时文件）
             with ExcelFile(filepath) as ef:
                 ws = ef.active_sheet
-                # 处理结果列
-                try:
-                    result_col_idx = openpyxl.utils.column_index_from_string(self.result_col_input)
-                    is_new_col = False
-                    result_col_name = self.result_col_input
-                except:
-                    is_new_col = True
-                    result_col_name = self.result_col_input.strip()
-                    max_col = ws.max_column
-                    result_col_idx = max_col + 1
-                    ws.insert_cols(result_col_idx)
-                    self._safe_write_cell(ws, self.header_row, result_col_idx, result_col_name)
+                result_col_idx, _ = self._resolve_result_column(ws, self.result_col_input)
 
-                if not is_new_col:
-                    existing = self._safe_get_cell_value(ws, self.header_row, result_col_idx)
-                    if existing is None or str(existing).strip() == "":
-                        self._safe_write_cell(ws, self.header_row, result_col_idx, result_col_name)
+                result_col_letter = None
+                try:
+                    result_col_letter = openpyxl.utils.get_column_letter(result_col_idx)
+                except Exception:
+                    pass
+
+                expr = self.expression
+                if result_col_letter:
+                    expr = self._remove_result_column_from_expr(result_col_letter)
+                    if not expr.strip():
+                        raise ValueError(f"表达式在移除结果列 {result_col_letter} 后为空")
+
+                variables = self.compute_engine.extract_variables(expr)
+                mapped_vars = {}
+                missing = []
+                for letter in variables:
+                    if letter in letter_to_name:
+                        mapped_vars[letter] = letter_to_name[letter]
+                    else:
+                        missing.append(letter)
+                if missing:
+                    raise ValueError(f"表达式中的列字母 {missing} 无法映射到文件中的任何列")
+
+                def calc_row(row):
+                    context = {letter: row[col_name] for letter, col_name in mapped_vars.items()}
+                    return self.compute_engine.evaluate_expression(expr, context)
+                df["Result"] = df.apply(calc_row, axis=1)
 
                 start_row = self.header_row + 1
                 end_row = ws.max_row
+                values = [None if pd.isna(v) else v for v in df["Result"].tolist()]
 
-                # 清除结果列合并
-                to_remove = []
-                for merged in ws.merged_cells.ranges:
-                    if merged.min_col <= result_col_idx <= merged.max_col:
-                        to_remove.append(merged)
-                for merged in to_remove:
-                    ws.unmerge_cells(str(merged))
+                self._write_result_column(ws, result_col_idx, values, start_row, end_row)
 
-                # 写入计算结果
-                for i, val in enumerate(df["Result"]):
-                    ws.cell(start_row + i, result_col_idx).value = val
+                if variables:
+                    ref_col_letter = sorted(variables)[0]
+                    self._copy_merge_structure(ws, ref_col_letter, result_col_idx, start_row, end_row)
 
-                # 处理合并依据列
-                if self.merge_by_cols_str:
-                    merge_keys = [openpyxl.utils.column_index_from_string(c.strip()) for c in self.merge_by_cols_str.split(",") if c.strip()]
-                    if merge_keys:
-                        ref_col = merge_keys[0]
-                        has_merge = any(m.min_col <= ref_col <= m.max_col for m in ws.merged_cells.ranges)
-                        if has_merge:
-                            try:
-                                copy_merge_structure(ws, ref_col, ws, result_col_idx, start_row, end_row)
-                                logger.info(f"已复制合并结构 from {self.merge_by_cols_str} to {self.result_col_input}")
-                            except Exception as e:
-                                logger.warning(f"复制合并结构失败: {e}")
-                        else:
-                            logger.info(f"源列 {self.merge_by_cols_str} 无合并单元格，跳过")
+                if self.merge_by_cols:
+                    merge_indices = []
+                    for col in self.merge_by_cols:
+                        try:
+                            merge_indices.append(openpyxl.utils.column_index_from_string(col))
+                        except Exception:
+                            if col in name_to_letter:
+                                merge_indices.append(openpyxl.utils.column_index_from_string(name_to_letter[col]))
+                            else:
+                                raise ValueError(f"合并依据列 {col} 无效")
+                    group_first_row = {}
+                    for row in range(start_row, end_row + 1):
+                        key = tuple(safe_get_cell_value(ws, row, col) for col in merge_indices)
+                        if key not in group_first_row:
+                            group_first_row[key] = row
+                    for row in range(start_row, end_row + 1):
+                        key = tuple(safe_get_cell_value(ws, row, col) for col in merge_indices)
+                        if row != group_first_row.get(key):
+                            safe_write_cell(ws, row, result_col_idx, None)
 
-                # 确定输出路径
-                if ext == '.xls':
-                    # 对于 .xls 文件，输出到原目录下，文件名加“_处理版.xlsx”
-                    base_name = os.path.splitext(os.path.basename(self.original_filepath))[0]
-                    result_path = os.path.join(os.path.dirname(self.original_filepath), f"{base_name}_处理版.xlsx")
-                else:
-                    base_name = os.path.splitext(os.path.basename(self.original_filepath))[0]
-                    result_path = os.path.join(os.path.dirname(self.original_filepath), f"{base_name}_处理版.xlsx")
-
+                result_path = self._get_output_path()
                 ef.save(result_path)
                 ef._workbook.close()
 
             gc.collect()
             return result_path
-
         finally:
-            # 清理临时文件（如果创建了）
-            if self.temp_file and os.path.exists(self.temp_file):
-                try:
-                    os.unlink(self.temp_file)
-                except:
-                    pass
-
-    @staticmethod
-    def _safe_get_cell_value(ws, row, col):
-        cell = ws.cell(row, col)
-        if isinstance(cell, openpyxl.cell.cell.MergedCell):
-            for merged_range in ws.merged_cells.ranges:
-                if merged_range.min_row <= row <= merged_range.max_row and merged_range.min_col <= col <= merged_range.max_col:
-                    return ws.cell(merged_range.min_row, merged_range.min_col).value
-        return cell.value
-
-    @staticmethod
-    def _safe_write_cell(ws, row, col, value):
-        cell = ws.cell(row, col)
-        if isinstance(cell, openpyxl.cell.cell.MergedCell):
-            to_unmerge = []
-            for merged_range in ws.merged_cells.ranges:
-                if (merged_range.min_row <= row <= merged_range.max_row and
-                    merged_range.min_col <= col <= merged_range.max_col):
-                    to_unmerge.append(str(merged_range))
-            for rng in to_unmerge:
-                ws.unmerge_cells(rng)
-        ws.cell(row, col).value = value
+            self._cleanup_temp()
 
 
-class AggregateBackfillProcessor:
-    """聚合回填处理器（同样支持 .xls 转换）"""
-    def __init__(self, filepath, header_row, group_cols_raw, agg_cols_raw, agg_func, result_col_input, compute_engine):
-        self.original_filepath = filepath
-        self.header_row = header_row
+class AggregateBackfillProcessor(BaseExcelProcessor):
+    """聚合回填处理器"""
+
+    def __init__(self, filepath: str, header_row: int,
+                 group_cols_raw: List[str], agg_cols_raw: List[str],
+                 agg_func: str, result_col_input: str, compute_engine: ComputeEngine):
+        super().__init__(filepath, header_row, compute_engine)
         self.group_cols_raw = group_cols_raw
         self.agg_cols_raw = agg_cols_raw
         self.agg_func = agg_func
         self.result_col_input = result_col_input
-        self.compute_engine = compute_engine
-        self.dal = get_data_access_layer()
-        self.temp_file = None
 
-    def process(self):
-        ext = os.path.splitext(self.original_filepath)[1].lower()
-        if ext == '.xls':
-            self.temp_file = convert_xls_to_xlsx(self.original_filepath)
-            filepath = self.temp_file
-        else:
-            filepath = self.original_filepath
-
+    def process(self) -> str:
+        filepath = self._get_work_filepath()
         try:
-            # 读取表头获取列名
+            # 读取表头（仅列名），先不读取数据
             df_header = pd.read_excel(filepath, header=self.header_row - 1, nrows=0)
             headers = list(df_header.columns)
             letter_to_name, name_to_letter = build_column_mapping(headers)
 
-            def resolve_col(col):
+            def resolve_col(col: str) -> str:
                 col = col.strip()
                 if col in headers:
                     return col
@@ -1712,9 +1706,9 @@ class AggregateBackfillProcessor:
             group_cols = [resolve_col(c) for c in self.group_cols_raw]
             agg_cols = [resolve_col(c) for c in self.agg_cols_raw]
 
-            # 读取数据并清洗
+            # 以字符串类型读取数据
             df = pd.read_excel(filepath, header=self.header_row - 1, dtype=str)
-            df = self.dal._auto_clean_dataframe(df)
+            df = safe_cleanup_dataframe(df, auto_convert_numeric=True)
 
             missing = [c for c in group_cols + agg_cols if c not in df.columns]
             if missing:
@@ -1722,95 +1716,46 @@ class AggregateBackfillProcessor:
 
             result_df = self.compute_engine.simple_aggregate(df, group_cols, agg_cols, self.agg_func)
 
-            # 回填到原始 Excel
             with ExcelFile(filepath) as ef:
                 ws = ef.active_sheet
-                # 建立列名到列索引的映射
-                name_to_col_idx = {}
-                for idx, cell in enumerate(ws[self.header_row], start=1):
-                    if cell.value is not None:
-                        name_to_col_idx[str(cell.value).strip()] = idx
+                name_to_idx = build_column_name_mapping(ws, self.header_row)
 
-                def get_col_index(col):
+                def get_col_index(col: str) -> int:
                     col = col.strip()
-                    if col in name_to_col_idx:
-                        return name_to_col_idx[col]
+                    if col in name_to_idx:
+                        return name_to_idx[col]
                     try:
                         return openpyxl.utils.column_index_from_string(col)
-                    except ValueError:
+                    except Exception:
                         raise ValueError(f"列 '{col}' 在原始表中不存在")
 
                 group_col_indices = [get_col_index(c) for c in group_cols]
 
-                # 处理结果列
-                try:
-                    result_col_idx = openpyxl.utils.column_index_from_string(self.result_col_input)
-                    is_new_col = False
-                    result_col_name = self.result_col_input
-                except:
-                    is_new_col = True
-                    result_col_name = self.result_col_input.strip()
-                    result_col_idx = ws.max_column + 1
-                    ws.insert_cols(result_col_idx)
-                    self._safe_write_cell(ws, self.header_row, result_col_idx, result_col_name)
+                result_col_idx, _ = self._resolve_result_column(ws, self.result_col_input)
 
-                if not is_new_col:
-                    existing = self._safe_get_cell_value(ws, self.header_row, result_col_idx)
-                    if existing is None or str(existing).strip() == "":
-                        self._safe_write_cell(ws, self.header_row, result_col_idx, result_col_name)
-
-                # 构建聚合结果映射
                 result_map = {}
                 for _, row in result_df.iterrows():
                     key = tuple(str(row[c]) for c in group_cols)
-                    result_map[key] = row[agg_cols[0]]
+                    val = row[agg_cols[0]]
+                    if hasattr(val, 'item'):
+                        val = val.item()
+                    result_map[key] = val
 
                 start_row = self.header_row + 1
                 end_row = ws.max_row
                 for row in range(start_row, end_row + 1):
-                    key = tuple(str(ws.cell(row, idx).value) for idx in group_col_indices)
-                    ws.cell(row, result_col_idx).value = result_map.get(key, "")
+                    key = tuple(str(safe_get_cell_value(ws, row, idx)) for idx in group_col_indices)
+                    val = result_map.get(key, "")
+                    safe_write_cell(ws, row, result_col_idx, val)
 
-                if ext == '.xls':
-                    base_name = os.path.splitext(os.path.basename(self.original_filepath))[0]
-                    result_path = os.path.join(os.path.dirname(self.original_filepath), f"{base_name}_处理版.xlsx")
-                else:
-                    base_name = os.path.splitext(os.path.basename(self.original_filepath))[0]
-                    result_path = os.path.join(os.path.dirname(self.original_filepath), f"{base_name}_处理版.xlsx")
-
+                result_path = self._get_output_path()
                 ef.save(result_path)
                 ef._workbook.close()
 
             gc.collect()
             return result_path
         finally:
-            if self.temp_file and os.path.exists(self.temp_file):
-                try:
-                    os.unlink(self.temp_file)
-                except:
-                    pass
-
-    @staticmethod
-    def _safe_get_cell_value(ws, row, col):
-        cell = ws.cell(row, col)
-        if isinstance(cell, openpyxl.cell.cell.MergedCell):
-            for merged_range in ws.merged_cells.ranges:
-                if merged_range.min_row <= row <= merged_range.max_row and merged_range.min_col <= col <= merged_range.max_col:
-                    return ws.cell(merged_range.min_row, merged_range.min_col).value
-        return cell.value
-
-    @staticmethod
-    def _safe_write_cell(ws, row, col, value):
-        cell = ws.cell(row, col)
-        if isinstance(cell, openpyxl.cell.cell.MergedCell):
-            to_unmerge = []
-            for merged_range in ws.merged_cells.ranges:
-                if (merged_range.min_row <= row <= merged_range.max_row and
-                    merged_range.min_col <= col <= merged_range.max_col):
-                    to_unmerge.append(str(merged_range))
-            for rng in to_unmerge:
-                ws.unmerge_cells(rng)
-        ws.cell(row, col).value = value
+            self._cleanup_temp()
     ```
 
 - **services/excel/compute_engine.py**
@@ -2296,6 +2241,7 @@ from services.excel.calculator import ColumnCalculator
 from services.excel.aggregator import Aggregator
 from core.excel_utils import ExcelFile
 
+
 class TestColumnCalculator:
     def test_calculate_column(self, tmp_path):
         wb = Workbook()
@@ -2309,10 +2255,12 @@ class TestColumnCalculator:
         ws['B3'] = 3
         test_file = tmp_path / 'test.xlsx'
         wb.save(test_file)
+
         with ExcelFile(test_file) as ef:
             calculator = ColumnCalculator(ef)
             calculator.calculate_column('A+B', 'C', merge_by_cols=None)
             ef.save(test_file)
+
         result_df = pd.read_excel(test_file)
         assert result_df.loc[0, 'Result'] == 30
         assert result_df.loc[1, 'Result'] == 8
@@ -2331,14 +2279,17 @@ class TestColumnCalculator:
         ws['B4'] = 5
         test_file = tmp_path / 'test.xlsx'
         wb.save(test_file)
+
         with ExcelFile(test_file) as ef:
             calculator = ColumnCalculator(ef)
             calculator.calculate_column('B*2', 'C', merge_by_cols=['A'])
             ef.save(test_file)
+
         result_df = pd.read_excel(test_file)
         assert result_df.loc[0, 'Result'] == 20
         assert pd.isna(result_df.loc[1, 'Result'])
         assert result_df.loc[2, 'Result'] == 10
+
 
 class TestAggregator:
     def test_aggregate_sum(self):
@@ -2373,11 +2324,13 @@ class TestAggregator:
 import io
 from openpyxl import load_workbook
 
+
 class TestCalculatorIntegration:
     def test_column_calculation(self, client, sample_excel_file):
         data = {
             'file': (sample_excel_file, 'test.xlsx'),
             'calc_type': 'column',
+            'header_row': '1',
             'expression': 'A+B',
             'result_col_column': 'D',
             'merge_by_cols': ''
@@ -2395,6 +2348,7 @@ class TestCalculatorIntegration:
         data = {
             'file': (sample_excel_file, 'test.xlsx'),
             'calc_type': 'aggregate',
+            'header_row': '1',
             'group_cols': 'A',
             'agg_cols': 'B',
             'agg_func': 'sum',
@@ -2418,6 +2372,7 @@ class TestCalculatorIntegration:
         data = {
             'file': (sample_excel_file, 'test.xlsx'),
             'calc_type': 'column',
+            'header_row': '1',
             'expression': '',
             'result_col_column': 'D'
         }

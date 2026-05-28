@@ -44,6 +44,7 @@ def scheduled_cleanup(app):
 
 def create_app():
     app = Flask(__name__)
+    app.debug = False
     raw_dict = settings.model_dump()
     flat_config = {}
     for key, value in raw_dict.items():
