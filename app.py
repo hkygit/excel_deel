@@ -121,7 +121,7 @@ if __name__ == '__main__':
     try:
         port = int(os.environ.get('PORT', 5000))
         logger.info(f"启动服务...端口 {port}")
-        serve(app, host='0.0.0.0', port=port,
+        serve(app, host='127.0.0.1', port=port,
               max_request_body_size=2*1024*1024*1024,
               channel_timeout=3600, connection_limit=100,
               clear_untrusted_proxy_headers=True, _quiet=False)
