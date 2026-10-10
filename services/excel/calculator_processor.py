@@ -177,27 +177,67 @@ class ColumnCalculatorProcessor(BaseExcelProcessor):
         self.merge_by_cols = [c.strip() for c in merge_by_cols_str.split(',') if c.strip()] if merge_by_cols_str else []
 
     def _remove_result_column_from_expr(self, result_col_letter: str) -> str:
-        """从表达式中移除结果列字母（如果存在）"""
+        """从表达式中移除与结果列字母"完全匹配"的标识符 token。
+
+        使用 token 级匹配（而不是 str.replace 子串替换），避免破坏那些
+        只是"包含"结果列字母的标识符。例如结果列为 'A' 时：
+            'A+B'   -> 'B'        移除独立的 'A'
+            'AA+B'  -> 'AA+B'     'AA' 是独立标识符，不受影响
+            'AB+A'  -> 'AB'       仅移除独立的 'A'，不动 'AB'
+            'A+B-C' -> 'A-C'      移除 'B' 及其邻近的二元运算符
+
+        当某个匹配的标识符被移除时，会一并移除它邻近的二元运算符，避免
+        残留 '(A+)*C'、'A+-C' 这类非法表达式。
+        """
         if not result_col_letter or not self.expression:
             return self.expression
 
-        expr = self.expression.upper()
-        result_col_letter = result_col_letter.upper()
+        target = result_col_letter.upper()
+        expr_upper = self.expression.upper()
 
-        # 简单替换结果列字母
-        new_expr = expr.replace(result_col_letter, '')
-
-        # 清理多余的运算符
+        # 分词：标识符（首字符字母）、数字（含小数）、运算符、括号
         import re
-        new_expr = re.sub(r'[+-]{2,}', '+', new_expr)  # 多个+-转为+
-        new_expr = re.sub(r'[*/]{2,}', '*', new_expr)  # 多个*/转为*
-        new_expr = re.sub(r'^\s*[+-*/]+\s*', '', new_expr)  # 开头运算符
-        new_expr = re.sub(r'\s*[+-*/]+\s*$', '', new_expr)  # 结尾运算符
+        token_re = re.compile(r'[A-Z][A-Z0-9]*|\d+(?:\.\d+)?|[()+\-*/]')
+        tokens = token_re.findall(expr_upper)
 
-        if new_expr != expr:
-            logger.warning(f"表达式中包含了结果列 {result_col_letter}，已自动移除: {expr} -> {new_expr}")
+        # 快速路径：没有与结果列完全相等的标识符 token，无需移除
+        if not any(t == target and t.isalpha() for t in tokens):
+            return self.expression
 
-        return new_expr if new_expr.strip() else '0'  # 如果表达式为空，返回0
+        binary_ops = {'+', '-', '*', '/'}
+
+        # 标记需要移除的 token 下标
+        to_remove = set()
+        n = len(tokens)
+        for i, tok in enumerate(tokens):
+            if tok == target and tok.isalpha():
+                to_remove.add(i)
+                # 优先连同前面的二元运算符一起移除
+                if i > 0 and tokens[i - 1] in binary_ops:
+                    to_remove.add(i - 1)
+                # 否则，连同后面的二元运算符一起移除
+                elif i + 1 < n and tokens[i + 1] in binary_ops:
+                    to_remove.add(i + 1)
+
+        remaining = [tok for i, tok in enumerate(tokens) if i not in to_remove]
+
+        # 清理首尾残留的运算符
+        while remaining and remaining[0] in binary_ops:
+            remaining.pop(0)
+        while remaining and remaining[-1] in binary_ops:
+            remaining.pop()
+
+        new_expr = ''.join(remaining).strip()
+        if not new_expr:
+            new_expr = '0'
+
+        if new_expr != expr_upper:
+            logger.warning(
+                f"表达式中包含了结果列 {target}，已自动移除: "
+                f"{self.expression} -> {new_expr}"
+            )
+
+        return new_expr
 
     def process(self) -> str:
         # 使用缓存的或转换后的工作文件路径
