@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-P1-1 修复脚本：TaskStorage 迁移到 SQLite + WAL
+P0 修复脚本：normalize_excel_file 对有效 .xlsx 直接返回原路径
 
-新增能力：
-- 原子性：所有写操作走 SQLite 事务（BEGIN IMMEDIATE）
-- 多进程安全：WAL 模式（读不阻塞写、写不阻塞读）
-- 崩溃恢复：recover_orphan_tasks() 把 pending/running 标记为 failed
-- 高效查询：按 status / created_at 建立索引
-- 旧数据迁移：__init__ 时自动导入 status_dir/*.json
-- 未知字段：写入 extra 列（JSON），load 时 merge 回 dict
+核心目标：
+    消除"同一文件在一次请求里被反复复制"的问题。
 
-接口完全兼容：
-- save / load / update / delete / append_log / get_log / get_output_dir
-- 所有 blueprint、manager、decorator 零改动
+判定逻辑（对 ext == '.xlsx'）：
+    1) 文件头是 PK\x03\x04（ZIP magic）
+    2) ZIP 内部存在 xl/ 目录（是真正的 xlsx 而不是普通 zip）
+    3) openpyxl 能打开（read_only 模式）
+    4) 所有 sheet 的 max_row / max_column 不超过上限
+    以上全通过 → 直接返回原路径，零复制
+    尺寸超限    → 立即抛 ExcelNormalizationError（不进 pandas 兜底）
+    其余失败    → 降级走原有的 openpyxl / pandas 转换路径
+
+对 .xls / .xlsm / 损坏 .xlsx：
+    保持原有转换逻辑不变
 
 本脚本只写文件，不运行测试。
 """
@@ -22,885 +25,585 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-STORAGE_PATH = os.path.join(BASE_DIR, "core", "task", "storage.py")
-TEST_PATH = os.path.join(BASE_DIR, "tests", "test_core_task.py")
+EXCEL_HELPERS_PATH = os.path.join(BASE_DIR, "core", "excel_helpers.py")
+TEST_PATH = os.path.join(BASE_DIR, "tests", "test_excel_helpers.py")
 
 
 # ============================================================================
-# 1) core/task/storage.py 完整内容
+# 1) core/excel_helpers.py 完整内容
 # ============================================================================
-STORAGE_CONTENT = r'''# core/task/storage.py
-"""基于 SQLite + WAL 的任务状态存储。
+EXCEL_HELPERS_CONTENT = r'''"""
+Excel 文件辅助函数。
 
-设计要点：
-- 单文件数据库（status_dir/tasks.db），零外部依赖（sqlite3 是标准库）
-- WAL 模式：读不阻塞写，写不阻塞读，多进程安全
-- 每个操作独立连接，避免跨线程/跨进程连接共享问题
-- 所有写操作走 BEGIN IMMEDIATE 事务，保证原子性
-- 自动迁移旧的 JSON 文件到数据库（备份到 .migrated/ 子目录）
-- 未知字段自动落 extra 列（JSON），load 时 merge 回 dict
-
-公开接口与旧版 JSON 实现保持一致，因此 blueprint / manager / decorator
-无需任何改动。
+P0 变更：
+- normalize_excel_file 对已经是有效 .xlsx 的文件直接返回原路径，
+  避免无意义的"复制到临时文件再读回"。
+- 新增 _validate_xlsx 做轻量校验（文件头 + ZIP 结构 + openpyxl 尺寸检查）。
 """
-import json
-import logging
 import os
-import sqlite3
-import threading
-from datetime import datetime
-from typing import Any, Dict, Optional
+import logging
+import tempfile
+import zipfile
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 logger = logging.getLogger(__name__)
 
 
-# tasks 表中除主键 task_id 之外的固定列
-_TASK_COLUMNS = (
-    'status', 'created_at', 'started_at', 'completed_at',
-    'result_path', 'result_format', 'error',
-    'total_input_rows', 'total_output_rows',
-    'progress_percent', 'progress_message',
-    'params',                # 存储为 JSON 字符串
-    'original_filename',
-    'heartbeat',
-)
-
-# 需要在写入时 json.dumps / 读取时 json.loads 的列
-_JSON_COLUMNS = {'params'}
+# Excel 单表硬限制（参考 Office Open XML 规范）
+MAX_EXCEL_ROWS = 1_048_576   # 2^20
+MAX_EXCEL_COLS = 16_384      # 2^14
 
 
-class TaskStorage:
-    """SQLite 支持的任务状态存储。
+class ExcelNormalizationError(ValueError):
+    """
+    Excel 文件规范化过程中无法安全处理时抛出。
 
-    与旧版 JSON 实现保持完全一致的方法签名，同时提供：
-    - 原子性更新（SQLite 事务）
-    - 多进程并发安全（WAL 模式）
-    - 崩溃恢复（recover_orphan_tasks）
-    - 高效按状态 / 时间查询（索引）
+    当前触发场景：
+    - 单表行数 / 列数超过设定的上限（不再静默截断）
+
+    继承自 ValueError 以保持向后兼容：调用方若只 except ValueError 仍能捕获。
     """
 
-    DB_FILENAME = 'tasks.db'
 
-    def __init__(
-        self,
-        status_dir: str,
-        output_dir: str,
-        db_path: Optional[str] = None,
-        auto_migrate: bool = True,
-    ):
-        self.status_dir = status_dir
-        self.output_dir = output_dir
-        self.db_path = db_path or os.path.join(status_dir, self.DB_FILENAME)
-
-        # 兼容旧调用方：保留一个进程内的锁。真正的并发安全由 SQLite 提供。
-        self._lock = threading.RLock()
-
-        os.makedirs(status_dir, exist_ok=True)
-        os.makedirs(output_dir, exist_ok=True)
-
-        self._init_db()
-
-        if auto_migrate:
-            try:
-                self._migrate_json_files()
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"迁移旧 JSON 任务文件失败（不影响新功能）: {e}")
-
-    # ------------------------------------------------------------------ #
-    # 连接与初始化
-    # ------------------------------------------------------------------ #
-    def _connect(self) -> sqlite3.Connection:
-        """打开一个新的连接。
-
-        - isolation_level=None：显式控制事务（BEGIN IMMEDIATE / COMMIT）
-        - PRAGMA 是 per-connection 的，因此每次连接都要设置一次
-        - check_same_thread 保持默认 True：每次操作独立连接，不跨线程复用
-        """
-        conn = sqlite3.connect(
-            self.db_path,
-            timeout=10.0,
-            isolation_level=None,
+def _check_size_limits(rows: int, cols: int, sheet_label: str,
+                       max_rows: int, max_cols: int) -> None:
+    """尺寸超限时抛 ExcelNormalizationError。"""
+    if rows and rows > max_rows:
+        raise ExcelNormalizationError(
+            f"{sheet_label} 行数 {rows:,} 超过上限 {max_rows:,}；"
+            f"为避免静默截断数据，处理已中止。"
+            f"建议先拆分/抽样文件，或通过 max_rows 参数显式提高上限。"
         )
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+    if cols and cols > max_cols:
+        raise ExcelNormalizationError(
+            f"{sheet_label} 列数 {cols:,} 超过上限 {max_cols:,}；"
+            f"为避免静默截断数据，处理已中止。"
+            f"建议先拆分/抽样文件，或通过 max_cols 参数显式提高上限。"
+        )
 
-    def _init_db(self) -> None:
-        """创建表与索引（幂等）。"""
-        conn = self._connect()
+
+def _validate_xlsx(filepath: str, max_rows: int, max_cols: int) -> bool:
+    """快速校验 .xlsx 是否有效且尺寸合规。
+
+    返回:
+        True  - 文件有效且尺寸合规（可安全地返回原路径）
+        False - 文件无效（需走转换路径）
+    抛出:
+        ExcelNormalizationError - 尺寸超限（不进入转换路径）
+
+    不创建任何临时文件，不修改原文件。
+    """
+    # 1) 文件头检查（ZIP magic）
+    try:
+        with open(filepath, 'rb') as f:
+            if f.read(4) != b'PK\x03\x04':
+                return False
+    except OSError:
+        return False
+
+    # 2) ZIP 结构检查（比 openpyxl 更轻量，不解析样式 / 关系）
+    try:
+        with zipfile.ZipFile(filepath, 'r') as zf:
+            names = zf.namelist()
+            # 有效 xlsx 至少包含 xl/ 目录下的内容
+            if not any(n.startswith('xl/') for n in names):
+                return False
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+    # 3) openpyxl 打开 + 尺寸检查（read_only 模式下 max_row / max_column
+    #    从 XML 元数据读取，不会真的全量扫描单元格）
+    try:
+        wb = load_workbook(
+            filename=filepath,
+            data_only=True,
+            read_only=True,
+            keep_vba=False,
+        )
+    except Exception:
+        return False
+
+    try:
+        for ws in wb.worksheets:
+            rows = ws.max_row or 0
+            cols = ws.max_column or 0
+            if rows > max_rows or cols > max_cols:
+                _check_size_limits(
+                    rows, cols,
+                    sheet_label=f"工作表 '{ws.title}'",
+                    max_rows=max_rows, max_cols=max_cols,
+                )
+    finally:
+        wb.close()
+
+    return True
+
+
+def normalize_excel_file(
+    filepath: str,
+    max_rows: int = MAX_EXCEL_ROWS,
+    max_cols: int = MAX_EXCEL_COLS,
+) -> str:
+    """确保文件是可被下游正常读写的 .xlsx。
+
+    P0 语义变化：
+    - 对**有效的 .xlsx**：直接返回原路径（零复制），调用方需保证只读不改
+    - 对 .xls / .xlsm / 损坏 .xlsx：走转换路径，返回新的临时文件
+    - 尺寸超限：抛 ExcelNormalizationError（不静默截断）
+
+    Args:
+        filepath: 原始文件路径
+        max_rows: 单表允许的最大行数（默认 Excel 硬限制）
+        max_cols: 单表允许的最大列数（默认 Excel 硬限制）
+
+    Returns:
+        可安全读写的 .xlsx 路径（可能是原路径，也可能是新的临时文件）
+
+    Raises:
+        FileNotFoundError: 源文件不存在
+        ExcelNormalizationError: 超过行/列上限
+        ValueError: 所有读取方式都失败
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"文件不存在: {filepath}")
+
+    ext = os.path.splitext(filepath)[1].lower()
+
+    # ===== P0：有效 .xlsx 直接返回原路径，零复制 =====
+    if ext == '.xlsx':
         try:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    task_id           TEXT PRIMARY KEY,
-                    status            TEXT NOT NULL,
-                    created_at        TEXT NOT NULL,
-                    started_at        TEXT,
-                    completed_at      TEXT,
-                    result_path       TEXT,
-                    result_format     TEXT,
-                    error             TEXT,
-                    total_input_rows  INTEGER,
-                    total_output_rows INTEGER,
-                    progress_percent  INTEGER,
-                    progress_message  TEXT,
-                    params            TEXT,
-                    original_filename TEXT,
-                    heartbeat         TEXT,
-                    extra             TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_tasks_status
-                    ON tasks(status);
-                CREATE INDEX IF NOT EXISTS idx_tasks_created
-                    ON tasks(created_at DESC);
-
-                CREATE TABLE IF NOT EXISTS task_logs (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id    TEXT NOT NULL,
-                    timestamp  TEXT NOT NULL,
-                    message    TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_logs_task
-                    ON task_logs(task_id, id);
-            """)
-        finally:
-            conn.close()
-        logger.debug(f"TaskStorage 初始化完成: {self.db_path}")
-
-    # ------------------------------------------------------------------ #
-    # 序列化辅助
-    # ------------------------------------------------------------------ #
-    def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
-        """把 sqlite3.Row 转为 dict，解析 JSON 列，merge extra。"""
-        d: Dict[str, Any] = {}
-        for key in row.keys():
-            if key == 'extra':
-                continue
-            d[key] = row[key]
-
-        # 解析 JSON 列
-        for col in _JSON_COLUMNS:
-            if col in d and isinstance(d[col], str):
-                try:
-                    d[col] = json.loads(d[col])
-                except (json.JSONDecodeError, TypeError):
-                    # 保持原字符串
-                    pass
-
-        # merge extra
-        extra_raw = row['extra']
-        if extra_raw:
-            try:
-                extra = json.loads(extra_raw)
-                if isinstance(extra, dict):
-                    # 不覆盖已知列
-                    for k, v in extra.items():
-                        d.setdefault(k, v)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(f"无法解析 extra 字段: {extra_raw!r}")
-        return d
-
-    def _split_fields(self, data: Dict[str, Any]):
-        """把 dict 拆成 (已知列 dict, 未知列 dict)。"""
-        known: Dict[str, Any] = {}
-        extra: Dict[str, Any] = {}
-        for k, v in data.items():
-            if k == 'task_id':
-                continue
-            if k in _TASK_COLUMNS:
-                if k in _JSON_COLUMNS and not isinstance(v, str):
-                    v = json.dumps(v, ensure_ascii=False)
-                known[k] = v
-            else:
-                extra[k] = v
-        return known, extra
-
-    # ------------------------------------------------------------------ #
-    # 核心 CRUD
-    # ------------------------------------------------------------------ #
-    def save(self, task_id: str, data: Dict) -> None:
-        """完整保存任务状态（upsert）。
-
-        - 若 task_id 不存在：INSERT 所有字段
-        - 若 task_id 已存在：仅更新 data 中提供的字段（合并语义）
-          · 已知列逐个更新
-          · 未知字段 merge 到 extra
-        """
-        payload = dict(data)
-        payload.pop('task_id', None)   # task_id 来自参数，忽略 data 里可能的重复
-        payload.setdefault('status', 'pending')
-        payload.setdefault('created_at', datetime.now().isoformat())
-
-        known, extra = self._split_fields(payload)
-
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-
-                cur = conn.execute(
-                    "SELECT extra FROM tasks WHERE task_id = ?", (task_id,)
+            if _validate_xlsx(filepath, max_rows, max_cols):
+                logger.info(
+                    f"文件已是有效 .xlsx，直接使用原路径: {filepath}"
                 )
-                row = cur.fetchone()
-                exists = row is not None
-
-                if exists:
-                    # ---------------- UPDATE ----------------
-                    set_parts, sql_params = [], []
-                    for k, v in known.items():
-                        if k in _JSON_COLUMNS and not isinstance(v, str):
-                            v = json.dumps(v, ensure_ascii=False)
-                        set_parts.append(f"{k} = ?")
-                        sql_params.append(v)
-
-                    if extra:
-                        existing_extra = {}
-                        if row['extra']:
-                            try:
-                                existing_extra = json.loads(row['extra']) or {}
-                            except (json.JSONDecodeError, TypeError):
-                                existing_extra = {}
-                        existing_extra.update(extra)
-                        set_parts.append("extra = ?")
-                        sql_params.append(
-                            json.dumps(existing_extra, ensure_ascii=False)
-                        )
-
-                    if set_parts:
-                        sql_params.append(task_id)
-                        conn.execute(
-                            f"UPDATE tasks SET {', '.join(set_parts)} "
-                            f"WHERE task_id = ?",
-                            sql_params,
-                        )
-                else:
-                    # ---------------- INSERT ----------------
-                    cols = ['task_id'] + list(known.keys()) + ['extra']
-                    placeholders = ','.join(['?'] * len(cols))
-                    values = (
-                        [task_id]
-                        + list(known.values())
-                        + [json.dumps(extra, ensure_ascii=False) if extra else None]
-                    )
-                    conn.execute(
-                        f"INSERT INTO tasks ({','.join(cols)}) "
-                        f"VALUES ({placeholders})",
-                        values,
-                    )
-
-                conn.execute("COMMIT")
-            except Exception:
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
-                raise
-            finally:
-                conn.close()
-
-    def load(self, task_id: str) -> Optional[Dict]:
-        conn = self._connect()
-        try:
-            cur = conn.execute(
-                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            return self._row_to_dict(row)
-        finally:
-            conn.close()
-
-    def update(self, task_id: str, **fields) -> None:
-        """更新部分字段。
-
-        若 task_id 不存在，抛 ValueError（与旧实现行为一致）。
-        """
-        if not fields:
-            return
-
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-
-                cur = conn.execute(
-                    "SELECT extra FROM tasks WHERE task_id = ?", (task_id,)
-                )
-                row = cur.fetchone()
-                if row is None:
-                    conn.execute("ROLLBACK")
-                    raise ValueError(f"Task {task_id} not found")
-
-                known, extra = self._split_fields(fields)
-
-                set_parts, sql_params = [], []
-                for k, v in known.items():
-                    if k in _JSON_COLUMNS and not isinstance(v, str):
-                        v = json.dumps(v, ensure_ascii=False)
-                    set_parts.append(f"{k} = ?")
-                    sql_params.append(v)
-
-                if extra:
-                    existing_extra = {}
-                    if row['extra']:
-                        try:
-                            existing_extra = json.loads(row['extra']) or {}
-                        except (json.JSONDecodeError, TypeError):
-                            existing_extra = {}
-                    existing_extra.update(extra)
-                    set_parts.append("extra = ?")
-                    sql_params.append(
-                        json.dumps(existing_extra, ensure_ascii=False)
-                    )
-
-                if set_parts:
-                    sql_params.append(task_id)
-                    conn.execute(
-                        f"UPDATE tasks SET {', '.join(set_parts)} "
-                        f"WHERE task_id = ?",
-                        sql_params,
-                    )
-
-                conn.execute("COMMIT")
-            except ValueError:
-                raise
-            except Exception:
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
-                raise
-            finally:
-                conn.close()
-
-    def delete(self, task_id: str) -> None:
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    "DELETE FROM tasks WHERE task_id = ?", (task_id,)
-                )
-                conn.execute(
-                    "DELETE FROM task_logs WHERE task_id = ?", (task_id,)
-                )
-                conn.execute("COMMIT")
-            except Exception:
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
-                raise
-            finally:
-                conn.close()
-
-    def get_output_dir(self) -> str:
-        return self.output_dir
-
-    # ------------------------------------------------------------------ #
-    # 日志
-    # ------------------------------------------------------------------ #
-    def append_log(self, task_id: str, message: str) -> None:
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT INTO task_logs (task_id, timestamp, message) "
-                "VALUES (?, ?, ?)",
-                (task_id, ts, message),
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
+                return filepath
+        except ExcelNormalizationError:
+            # 尺寸超限：立即向上抛，**不走转换路径**
+            # 原因：pandas / openpyxl 的全量读更容易 OOM，及早拦截更安全
             raise
-        finally:
-            conn.close()
-
-    def get_log(self, task_id: str, max_lines: int = 2000) -> str:
-        conn = self._connect()
-        try:
-            cur = conn.execute(
-                "SELECT timestamp, message FROM task_logs "
-                "WHERE task_id = ? ORDER BY id DESC LIMIT ?",
-                (task_id, max_lines),
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f".xlsx 有效性检测异常，降级为转换路径: {e}"
             )
-            rows = list(reversed(cur.fetchall()))
-            return ''.join(
-                f"[{r['timestamp']}] {r['message']}\n" for r in rows
-            )
-        finally:
-            conn.close()
 
-    # ------------------------------------------------------------------ #
-    # 崩溃恢复
-    # ------------------------------------------------------------------ #
-    def recover_orphan_tasks(
-        self, reason: str = '服务重启导致任务中断'
-    ) -> int:
-        """把所有 pending / running 的任务标记为 failed。
+    # ===== 以下为需要转换的场景（.xls / .xlsm / 损坏 .xlsx）=====
+    temp_dir = tempfile.gettempdir()
+    base_name = os.path.basename(filepath)
+    output_name = (
+        f"normalized_{os.path.splitext(base_name)[0]}_{os.urandom(4).hex()}.xlsx"
+    )
+    output_path = os.path.join(temp_dir, output_name)
 
-        服务启动时调用，避免 daemon 线程被杀后任务永远卡在 running。
-
-        Returns:
-            被恢复的任务数量。
-        """
-        now = datetime.now().isoformat()
-        with self._lock:
-            conn = self._connect()
+    def _safe_unlink(path: str) -> None:
+        if path and os.path.exists(path):
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                cur = conn.execute(
-                    "SELECT COUNT(*) AS c FROM tasks "
-                    "WHERE status IN ('pending', 'running')"
+                os.unlink(path)
+            except Exception as cleanup_err:  # noqa: BLE001
+                logger.debug(f"清理临时文件失败: {path} - {cleanup_err}")
+
+    try:
+        # 方法1: 用 openpyxl 读取并另存
+        try:
+            logger.info(f"尝试用openpyxl读取文件: {filepath}")
+            wb = load_workbook(
+                filename=filepath,
+                data_only=True,
+                read_only=True,
+                keep_vba=False,
+            )
+
+            # 尺寸检查（覆盖 .xls / .xlsm 等 _validate_xlsx 未校验的场景）
+            for ws in wb.worksheets:
+                rows = ws.max_row or 0
+                cols = ws.max_column or 0
+                if rows > max_rows or cols > max_cols:
+                    wb.close()
+                    _safe_unlink(output_path)
+                    _check_size_limits(
+                        rows, cols,
+                        sheet_label=f"工作表 '{ws.title}'",
+                        max_rows=max_rows, max_cols=max_cols,
+                    )
+
+            # 完整复制所有行列（read_only 模式下用 iter_rows 最快）
+            from openpyxl import Workbook
+            wb_new = Workbook()
+            wb_new.remove(wb_new.active)
+
+            for ws in wb.worksheets:
+                ws_new = wb_new.create_sheet(title=ws.title)
+                for row in ws.iter_rows(values_only=True):
+                    ws_new.append(list(row))
+
+            wb.close()
+            wb_new.save(output_path)
+            wb_new.close()
+
+            logger.info(f"已用openpyxl转换文件: {output_path}")
+            return output_path
+
+        except ExcelNormalizationError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"openpyxl 转换失败: {e}，回退到 pandas 方式")
+
+            # 方法2: pandas 兜底
+            try:
+                engine = None
+                if ext in ['.xls', '.xlsm']:
+                    engine = 'xlrd' if ext == '.xls' else 'openpyxl'
+
+                df = pd.read_excel(
+                    filepath,
+                    dtype=str,
+                    na_filter=False,
+                    engine=engine,
+                    header=None,
                 )
-                count = cur.fetchone()['c']
-                if count > 0:
-                    conn.execute(
-                        "UPDATE tasks "
-                        "SET status = 'failed', error = ?, completed_at = ? "
-                        "WHERE status IN ('pending', 'running')",
-                        (reason, now),
+
+                n_rows = df.shape[0]
+                n_cols = df.shape[1]
+                if n_rows > max_rows or n_cols > max_cols:
+                    _safe_unlink(output_path)
+                    _check_size_limits(
+                        n_rows, n_cols,
+                        sheet_label=f"文件 '{os.path.basename(filepath)}'",
+                        max_rows=max_rows, max_cols=max_cols,
                     )
-                conn.execute("COMMIT")
-                if count:
-                    logger.warning(
-                        f"已恢复 {count} 个僵尸任务为 failed"
-                    )
-                return count
-            except Exception:
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
+
+                df = df.fillna('')
+                df.to_excel(
+                    output_path, index=False, header=False,
+                    engine='openpyxl',
+                )
+
+                logger.info(f"已用pandas转换文件: {output_path}")
+                return output_path
+
+            except ExcelNormalizationError:
                 raise
-            finally:
-                conn.close()
+            except Exception as pd_e:  # noqa: BLE001
+                logger.error(f"pandas 读取也失败: {pd_e}")
 
-    # ------------------------------------------------------------------ #
-    # 旧 JSON 迁移
-    # ------------------------------------------------------------------ #
-    def _migrate_json_files(self) -> None:
-        """扫描 status_dir/*.json 导入到 DB，然后移动到 .migrated/。"""
-        if not os.path.isdir(self.status_dir):
-            return
-
-        try:
-            json_files = [
-                f for f in os.listdir(self.status_dir)
-                if f.endswith('.json') and not f.startswith('.')
-            ]
-        except OSError as e:
-            logger.warning(f"无法列出 status_dir: {e}")
-            return
-
-        if not json_files:
-            return
-
-        migrated_dir = os.path.join(self.status_dir, '.migrated')
-        os.makedirs(migrated_dir, exist_ok=True)
-
-        imported = 0
-        for fname in json_files:
-            json_path = os.path.join(self.status_dir, fname)
-            task_id = fname[:-5]  # 去掉 .json
-
-            try:
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                if not content:
-                    continue
-                data = json.loads(content)
-                if not isinstance(data, dict):
-                    logger.warning(f"跳过非 dict 的旧任务文件: {json_path}")
-                    continue
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"跳过损坏的 JSON 任务文件 {json_path}: {e}")
-                continue
-
-            # 已存在则跳过（但仍移动旧文件）
-            if self.load(task_id) is None:
+                # 方法3: 生成占位文件（保留原有兜底行为）
                 try:
-                    data.setdefault('task_id', task_id)
-                    self.save(task_id, data)
-                    imported += 1
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"导入旧任务 {task_id} 失败: {e}")
-                    continue
-
-            # 迁移对应的 .log 文件（如果有）
-            log_path = os.path.join(self.status_dir, f"{task_id}.log")
-            if os.path.exists(log_path):
-                try:
-                    log_rows = []
-                    with open(log_path, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            line = line.rstrip('\n')
-                            if not line:
-                                continue
-                            if line.startswith('[') and ']' in line:
-                                ts, msg = line[1:].split(']', 1)
-                                msg = msg.lstrip()
-                            else:
-                                ts = datetime.now().strftime(
-                                    '%Y-%m-%d %H:%M:%S'
-                                )
-                                msg = line
-                            log_rows.append((task_id, ts, msg))
-
-                    if log_rows:
-                        conn = self._connect()
-                        try:
-                            conn.execute("BEGIN IMMEDIATE")
-                            conn.executemany(
-                                "INSERT INTO task_logs "
-                                "(task_id, timestamp, message) "
-                                "VALUES (?, ?, ?)",
-                                log_rows,
-                            )
-                            conn.execute("COMMIT")
-                        except Exception:
-                            try:
-                                conn.execute("ROLLBACK")
-                            except sqlite3.OperationalError:
-                                pass
-                            raise
-                        finally:
-                            conn.close()
-
-                    os.replace(
-                        log_path, os.path.join(migrated_dir, f"{task_id}.log")
+                    from openpyxl import Workbook
+                    wb = Workbook()
+                    ws = wb.active
+                    ws.title = "Data"
+                    ws['A1'] = "错误: 无法读取原始文件"
+                    ws['A2'] = f"原始错误: {str(pd_e)[:100]}"
+                    wb.save(output_path)
+                    logger.warning(f"创建了空的修复文件: {output_path}")
+                    return output_path
+                except Exception as create_e:  # noqa: BLE001
+                    logger.error(f"创建修复文件也失败: {create_e}")
+                    raise ValueError(
+                        f"无法读取或转换 Excel 文件。请确保文件是有效的 Excel 文件。"
+                        f"原始错误: {pd_e}"
                     )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"迁移日志 {log_path} 失败: {e}")
 
-            # 移动 JSON 文件
+    except Exception as final_e:
+        logger.error(f"所有转换方法都失败: {final_e}")
+        _safe_unlink(output_path)
+        raise
+
+
+def safe_cleanup_dataframe(df: pd.DataFrame,
+                           auto_convert_numeric: bool = True) -> pd.DataFrame:
+    """安全清理 DataFrame。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = df[col].astype(str).str.strip()
+            df[col] = df[col].replace('', pd.NA)
+            df[col] = df[col].replace('nan', pd.NA)
+            df[col] = df[col].replace('None', pd.NA)
+            df[col] = df[col].replace('null', pd.NA)
+
+        if auto_convert_numeric and df[col].dtype == 'object':
             try:
-                os.replace(json_path, os.path.join(migrated_dir, fname))
-            except OSError as e:
-                logger.warning(
-                    f"移动旧任务文件 {json_path} 失败: {e}"
-                )
+                numeric_series = pd.to_numeric(df[col], errors='coerce')
+                if numeric_series.notna().any():
+                    df[col] = numeric_series
+            except Exception:
+                pass
 
-        if imported:
-            logger.info(f"已从 JSON 迁移 {imported} 个任务到 SQLite")
+    return df
+
+
+def build_column_name_mapping(ws, header_row: int):
+    """构建列名到列索引的映射。"""
+    mapping = {}
+    max_col = min(ws.max_column, 100)
+
+    for col_idx in range(1, max_col + 1):
+        cell = ws.cell(row=header_row, column=col_idx)
+        if cell and cell.value:
+            col_name = str(cell.value).strip()
+            if col_name:
+                mapping[col_name] = col_idx
+
+    return mapping
+
+
+def safe_get_cell_value(ws, row: int, col: int):
+    """安全获取单元格值。"""
+    try:
+        if row > ws.max_row or col > ws.max_column:
+            return None
+        cell = ws.cell(row=row, column=col)
+        return cell.value
+    except Exception:
+        return None
+
+
+def safe_write_cell(ws, row: int, col: int, value):
+    """安全写入单元格值。"""
+    try:
+        cell = ws.cell(row=row, column=col)
+        cell.value = value
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"写入单元格失败 ({row}, {col}): {e}")
+
+
+def clear_merges_in_column(ws, col_idx: int):
+    """清除指定列的合并单元格。"""
+    try:
+        ranges_to_remove = []
+        for merged_range in ws.merged_cells.ranges:
+            if merged_range.min_col <= col_idx <= merged_range.max_col:
+                ranges_to_remove.append(str(merged_range))
+
+        for range_str in ranges_to_remove:
+            ws.unmerge_cells(range_str)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"清除合并单元格失败: {e}")
+
+
+def safe_delete_file(filepath: str, max_retries: int = 3):
+    """安全删除文件，处理文件被占用的情况。"""
+    if not filepath or not os.path.exists(filepath):
+        return True
+
+    for i in range(max_retries):
+        try:
+            os.unlink(filepath)
+            logger.info(f"成功删除文件: {filepath}")
+            return True
+        except PermissionError as e:
+            if i < max_retries - 1:
+                import time
+                time.sleep(0.1 * (i + 1))
+                continue
+            logger.warning(f"删除文件失败(被占用): {filepath}, 错误: {e}")
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"删除文件失败: {filepath}, 错误: {e}")
+            return False
+
+    return False
 '''
 
 
 # ============================================================================
-# 2) tests/test_core_task.py 完整内容
+# 2) tests/test_excel_helpers.py 完整内容
 # ============================================================================
-TEST_CONTENT = r'''# tests/test_core_task.py
-"""TaskStorage / TaskManager 测试。
-
-覆盖：
-- 基础 CRUD（save / load / update / delete）
-- 未知字段的 extra 往返与合并
-- 任务日志隔离
-- WAL 模式已启用
-- 崩溃恢复（recover_orphan_tasks）
-- 多线程并发更新不丢数据
-- 旧 JSON 文件自动迁移
-- TaskManager 状态机
+TEST_CONTENT = r'''# tests/test_excel_helpers.py
 """
-import json
+针对 core.excel_helpers.normalize_excel_file 的回归测试。
+
+P0 语义：
+- 有效 .xlsx → 直接返回原路径（零复制）
+- .xls / 损坏 .xlsx → 走转换路径，返回新的临时文件
+- 尺寸超限 → 抛 ExcelNormalizationError
+"""
+import gc
 import os
-import sqlite3
-import threading
+import time
 
 import pytest
+from openpyxl import Workbook, load_workbook
 
-from core.task.storage import TaskStorage
-from core.task.manager import TaskManager
-from core.task.state import TaskStatus
-from core.task.base import Task
-
-
-class DummyTask(Task):
-    def __init__(self, should_fail=False, result_data=None):
-        self.should_fail = should_fail
-        self.result_data = result_data or {"output": "success"}
-
-    def execute(self):
-        if self.should_fail:
-            raise ValueError("模拟任务失败")
-        return self.result_data
+from core.excel_helpers import (
+    normalize_excel_file,
+    ExcelNormalizationError,
+    MAX_EXCEL_ROWS,
+    MAX_EXCEL_COLS,
+)
 
 
-# ============================================================================
-# TaskStorage
-# ============================================================================
-class TestTaskStorage:
-    @pytest.fixture
-    def storage(self, tmp_path):
-        status_dir = tmp_path / "status"
-        output_dir = tmp_path / "output"
-        return TaskStorage(str(status_dir), str(output_dir))
+def _make_simple_xlsx(path, n_rows: int = 2, n_cols: int = 2):
+    """生成一个简单 Excel 文件，返回其路径。"""
+    wb = Workbook()
+    ws = wb.active
+    ws.append([f"col{c + 1}" for c in range(n_cols)])
+    for r in range(1, n_rows):
+        ws.append([r * (c + 1) for c in range(n_cols)])
+    wb.save(str(path))
+    wb.close()
+    return str(path)
 
-    # ---------- 基础 CRUD ----------
-    def test_save_and_load(self, storage):
-        task_id = "test-123"
-        data = {"status": "pending", "value": 42}
-        storage.save(task_id, data)
-        loaded = storage.load(task_id)
-        assert loaded["value"] == 42
-        assert loaded["status"] == "pending"
-        assert loaded["task_id"] == task_id
 
-    def test_update(self, storage):
-        task_id = "test-123"
-        storage.save(task_id, {"status": "pending"})
-        storage.update(task_id, status="completed", result="ok")
-        loaded = storage.load(task_id)
-        assert loaded["status"] == "completed"
-        assert loaded["result"] == "ok"
+def _robust_unlink(path: str, attempts: int = 5, delay: float = 0.1) -> None:
+    """尽力清理系统临时目录下由 normalize_excel_file 生成的文件。
 
-    def test_delete(self, storage):
-        task_id = "delete-me"
-        storage.save(task_id, {})
-        assert storage.load(task_id) is not None
-        storage.delete(task_id)
-        assert storage.load(task_id) is None
-
-    def test_update_nonexistent_raises(self, storage):
-        with pytest.raises(ValueError, match="not found"):
-            storage.update("does-not-exist", status="completed")
-
-    # ---------- extra 字段 ----------
-    def test_extra_fields_roundtrip(self, storage):
-        task_id = "extra-test"
-        storage.save(
-            task_id,
-            {"status": "pending", "custom_a": 1, "custom_b": "x"},
-        )
-        loaded = storage.load(task_id)
-        assert loaded["custom_a"] == 1
-        assert loaded["custom_b"] == "x"
-
-    def test_extra_field_merges_on_update(self, storage):
-        task_id = "merge-test"
-        storage.save(task_id, {"status": "pending", "custom_a": 1})
-        storage.update(task_id, custom_b=2)
-        loaded = storage.load(task_id)
-        assert loaded["custom_a"] == 1
-        assert loaded["custom_b"] == 2
-
-    def test_params_dict_roundtrip(self, storage):
-        """params 字典应通过 JSON 往返无损。"""
-        task_id = "params-test"
-        params = {"file": "x.csv", "options": {"sep": ",", "enc": "utf-8"}}
-        storage.save(task_id, {"status": "pending", "params": params})
-        loaded = storage.load(task_id)
-        assert loaded["params"] == params
-
-    # ---------- 日志 ----------
-    def test_append_and_get_log(self, storage):
-        task_id = "log-test"
-        storage.append_log(task_id, "first line")
-        storage.append_log(task_id, "second line")
-        log = storage.get_log(task_id)
-        assert "first line" in log
-        assert "second line" in log
-        # 顺序应保持
-        assert log.index("first line") < log.index("second line")
-
-    def test_logs_isolated_by_task(self, storage):
-        storage.append_log("task-1", "hello 1")
-        storage.append_log("task-2", "hello 2")
-        assert "hello 1" in storage.get_log("task-1")
-        assert "hello 2" not in storage.get_log("task-1")
-
-    def test_get_log_limit(self, storage):
-        for i in range(10):
-            storage.append_log("many", f"line-{i}")
-        log = storage.get_log("many", max_lines=3)
-        # 应该只保留最后 3 行
-        assert "line-7" in log
-        assert "line-8" in log
-        assert "line-9" in log
-        assert "line-0" not in log
-
-    # ---------- SQLite 特性 ----------
-    def test_wal_mode_enabled(self, storage):
-        conn = sqlite3.connect(storage.db_path)
+    Windows 上 openpyxl / zipfile 可能在 close() 后仍短暂持有文件句柄，
+    因此做几次带 sleep 的重试；最后仍失败则吞掉异常。
+    """
+    gc.collect()
+    for _ in range(attempts):
+        if not os.path.exists(path):
+            return
         try:
-            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-            assert mode.lower() == "wal"
+            os.unlink(path)
+            return
+        except PermissionError:
+            gc.collect()
+            time.sleep(delay)
+    try:
+        os.unlink(path)
+    except PermissionError:
+        pass
+
+
+def _temp_normalized_files() -> set:
+    """返回系统临时目录下所有 normalized_*.xlsx 文件名。"""
+    import tempfile
+    return {
+        f for f in os.listdir(tempfile.gettempdir())
+        if f.startswith("normalized_") and f.endswith(".xlsx")
+    }
+
+
+class TestNormalizeExcelFile:
+    # ---------- P0 核心：有效 .xlsx 零复制 ----------
+    def test_valid_xlsx_returns_original_path_and_is_intact(self, tmp_path):
+        """P0 核心：有效 .xlsx 直接返回原路径，且内容不变。"""
+        src = _make_simple_xlsx(tmp_path / "simple.xlsx", n_rows=5, n_cols=3)
+
+        out = normalize_excel_file(src)
+
+        # 关键断言：返回的应该就是原路径
+        assert out == src, f"应返回原路径 {src}，实际 {out}"
+        assert os.path.exists(out)
+
+        # 内容应完整
+        wb = load_workbook(out, read_only=True)
+        try:
+            ws = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+            assert len(rows) == 5
+            assert rows[0] == ('col1', 'col2', 'col3')
+            assert rows[3] == (3, 6, 9)
         finally:
-            conn.close()
+            wb.close()
+        # 注意：out 就是 src，由 tmp_path fixture 自动清理，无需 unlink
 
-    def test_db_file_created(self, storage):
-        assert os.path.exists(storage.db_path)
-        assert storage.db_path.endswith("tasks.db")
+    def test_valid_xlsx_does_not_create_temp_file(self, tmp_path):
+        """P0 核心：有效 .xlsx 不创建任何 normalized_*.xlsx 临时文件。"""
+        src = _make_simple_xlsx(tmp_path / "no_copy.xlsx", n_rows=3, n_cols=2)
+        before = _temp_normalized_files()
 
-    # ---------- 崩溃恢复 ----------
-    def test_recover_orphan_tasks(self, storage):
-        storage.save("orphan-1", {"status": "running"})
-        storage.save("orphan-2", {"status": "pending"})
-        storage.save("done-1", {"status": "completed"})
-        storage.save("failed-1", {"status": "failed"})
+        out = normalize_excel_file(src)
 
-        count = storage.recover_orphan_tasks()
-        assert count == 2
+        after = _temp_normalized_files()
+        new_files = after - before
+        assert new_files == set(), f"不应创建临时文件: {new_files}"
+        assert out == src
 
-        assert storage.load("orphan-1")["status"] == "failed"
-        assert storage.load("orphan-2")["status"] == "failed"
-        assert storage.load("done-1")["status"] == "completed"
-        assert storage.load("failed-1")["status"] == "failed"
-        # 错误信息应该保留提示
-        assert "服务重启" in storage.load("orphan-1")["error"]
+    def test_multiple_calls_no_temp_file_accumulation(self, tmp_path):
+        """连续多次调用，每次都返回原路径，不累积临时文件。"""
+        src = _make_simple_xlsx(tmp_path / "multi.xlsx", n_rows=3, n_cols=2)
+        before = _temp_normalized_files()
 
-    def test_recover_orphan_tasks_empty(self, storage):
-        """没有 pending/running 时返回 0。"""
-        storage.save("x", {"status": "completed"})
-        assert storage.recover_orphan_tasks() == 0
+        results = [normalize_excel_file(src) for _ in range(3)]
 
-    # ---------- 并发 ----------
-    def test_concurrent_updates_do_not_lose_data(self, tmp_path):
-        """多线程同时更新同一 task 的不同字段，字段不应丢失。"""
-        storage = TaskStorage(
-            str(tmp_path / "s"), str(tmp_path / "o")
-        )
-        storage.save("conc", {"status": "running"})
+        after = _temp_normalized_files()
+        new_files = after - before
+        assert new_files == set(), f"多次调用不应产生临时文件: {new_files}"
+        assert all(r == src for r in results)
 
-        def worker(i):
-            storage.update("conc", **{f"field_{i}": i})
+    def test_below_limit_returns_original_path(self, tmp_path):
+        """恰好等于上限的 .xlsx 仍应返回原路径。"""
+        src = _make_simple_xlsx(tmp_path / "boundary.xlsx", n_rows=3, n_cols=2)
 
-        threads = [
-            threading.Thread(target=worker, args=(i,)) for i in range(20)
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        out = normalize_excel_file(src, max_rows=3, max_cols=2)
+        assert out == src
 
-        loaded = storage.load("conc")
-        for i in range(20):
-            assert loaded.get(f"field_{i}") == i, f"field_{i} lost"
+        wb = load_workbook(out, read_only=True)
+        try:
+            ws = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+            assert len(rows) == 3
+            assert len(rows[0]) == 2
+        finally:
+            wb.close()
 
-    # ---------- 旧 JSON 迁移 ----------
-    def test_json_migration(self, tmp_path):
-        """旧的 .json 任务文件应被迁移到 SQLite。"""
-        status_dir = tmp_path / "status"
-        status_dir.mkdir()
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
+    # ---------- 损坏文件仍走转换路径 ----------
+    def test_corrupt_xlsx_does_not_return_original_path(self, tmp_path):
+        """有 magic 但内部损坏的 .xlsx 不应直接返回原路径。"""
+        bad = tmp_path / "corrupt.xlsx"
+        # 有 ZIP magic，但内容是垃圾字节
+        bad.write_bytes(b"PK\x03\x04" + b"\x00" * 200)
 
-        legacy = {
-            "task_id": "legacy-1",
-            "status": "completed",
-            "created_at": "2026-01-01T00:00:00",
-            "result_path": "/tmp/x.xlsx",
-        }
-        (status_dir / "legacy-1.json").write_text(
-            json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
-        )
-        (status_dir / "legacy-1.log").write_text(
-            "[2026-01-01 00:00:01] hello\n"
-            "[2026-01-01 00:00:02] world\n",
-            encoding="utf-8",
-        )
+        out = normalize_excel_file(str(bad))
 
-        # 初始化时自动迁移
-        storage = TaskStorage(str(status_dir), str(output_dir))
+        # 关键断言：不能返回原路径（因为文件无效）
+        assert out != str(bad), "损坏文件不应直接返回原路径"
+        assert os.path.exists(out), "应返回一个可用的文件路径"
+        _robust_unlink(out)
 
-        loaded = storage.load("legacy-1")
-        assert loaded is not None
-        assert loaded["status"] == "completed"
-        assert loaded["result_path"] == "/tmp/x.xlsx"
+    # ---------- 基础异常 ----------
+    def test_file_not_found(self):
+        with pytest.raises(FileNotFoundError):
+            normalize_excel_file("/nonexistent/path/to/file.xlsx")
 
-        log = storage.get_log("legacy-1")
-        assert "hello" in log
-        assert "world" in log
+    # ---------- 尺寸上限 ----------
+    def test_exceed_rows_raises_instead_of_truncating(self, tmp_path):
+        """行数超限时抛 ExcelNormalizationError。"""
+        src = _make_simple_xlsx(tmp_path / "many_rows.xlsx", n_rows=11, n_cols=2)
 
-        # 旧文件应被移动到 .migrated/
-        migrated = status_dir / ".migrated"
-        assert migrated.is_dir()
-        assert (migrated / "legacy-1.json").exists()
+        with pytest.raises(ExcelNormalizationError, match="行数"):
+            normalize_excel_file(src, max_rows=5, max_cols=100)
 
-    def test_json_migration_skips_corrupt(self, tmp_path):
-        """损坏的 JSON 文件不应阻塞其他文件的迁移。"""
-        status_dir = tmp_path / "status"
-        status_dir.mkdir()
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
+    def test_exceed_cols_raises_instead_of_truncating(self, tmp_path):
+        """列数超限时抛 ExcelNormalizationError。"""
+        src = _make_simple_xlsx(tmp_path / "wide.xlsx", n_rows=2, n_cols=5)
 
-        (status_dir / "corrupt.json").write_text(
-            "{not valid json", encoding="utf-8"
-        )
-        (status_dir / "good.json").write_text(
-            json.dumps({"task_id": "good", "status": "completed"}),
-            encoding="utf-8",
-        )
+        with pytest.raises(ExcelNormalizationError, match="列数"):
+            normalize_excel_file(src, max_rows=100, max_cols=3)
 
-        storage = TaskStorage(str(status_dir), str(output_dir))
-        assert storage.load("good") is not None
-        # 损坏的文件保持原样（不能被识别为有效任务）
-        assert storage.load("corrupt") is None
+    def test_no_temp_file_left_on_size_error(self, tmp_path):
+        """尺寸超限时不应留下任何 normalized_*.xlsx 临时文件。"""
+        src = _make_simple_xlsx(tmp_path / "big.xlsx", n_rows=20, n_cols=2)
+        before = _temp_normalized_files()
 
+        with pytest.raises(ExcelNormalizationError):
+            normalize_excel_file(src, max_rows=5, max_cols=100)
 
-# ============================================================================
-# TaskManager（状态机）
-# ============================================================================
-class TestTaskManager:
-    @pytest.fixture
-    def storage(self, tmp_path):
-        status_dir = tmp_path / "status"
-        output_dir = tmp_path / "output"
-        return TaskStorage(str(status_dir), str(output_dir))
+        after = _temp_normalized_files()
+        leaked = after - before
+        assert leaked == set(), f"发现残留的临时文件: {leaked}"
 
-    @pytest.fixture
-    def manager(self, storage):
-        return TaskManager(storage)
+    # ---------- 常量与异常类型 ----------
+    def test_error_is_value_error_subclass(self):
+        """向后兼容：ExcelNormalizationError 必须是 ValueError 的子类。"""
+        assert issubclass(ExcelNormalizationError, ValueError)
 
-    def test_create_task(self, manager):
-        params = {"file": "test.csv"}
-        task_id = manager.create_task(params, original_filename="test")
-        assert task_id is not None
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.PENDING
-        assert status["params"] == params
-
-    def test_submit_and_complete(self, manager):
-        task_id = manager.create_task({})
-        manager.storage.update(task_id, status=TaskStatus.RUNNING)
-        manager.complete_task(
-            task_id, result_path="/out.xlsx", total_input_rows=100
-        )
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.COMPLETED
-        assert status["result_path"] == "/out.xlsx"
-
-    def test_fail_task(self, manager):
-        task_id = manager.create_task({})
-        manager.fail_task(task_id, error="Something wrong")
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.FAILED
-        assert status["error"] == "Something wrong"
-
-    def test_cancel_task(self, manager):
-        task_id = manager.create_task({})
-        manager.cancel_task(task_id)
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.CANCELLED
-
-    def test_manager_with_recover(self, manager, storage):
-        """模拟服务重启后，遗留的 running 任务应被恢复。"""
-        task_id = manager.create_task({})
-        manager.storage.update(task_id, status=TaskStatus.RUNNING)
-        # 模拟重启
-        count = storage.recover_orphan_tasks()
-        assert count == 1
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.FAILED
+    def test_default_limits_are_excel_hard_limits(self):
+        """默认上限应是 Excel 硬限制，而不是旧版静默截断的 100000 / 100。"""
+        assert MAX_EXCEL_ROWS == 1_048_576
+        assert MAX_EXCEL_COLS == 16_384
 '''
 
 
@@ -916,10 +619,10 @@ def write_file(path: str, content: str) -> None:
 
 def main() -> None:
     print("=" * 72)
-    print("P1-1：TaskStorage → SQLite + WAL")
+    print("P0：normalize_excel_file 对有效 .xlsx 直接返回原路径")
     print("=" * 72)
 
-    write_file(STORAGE_PATH, STORAGE_CONTENT)
+    write_file(EXCEL_HELPERS_PATH, EXCEL_HELPERS_CONTENT)
     write_file(TEST_PATH, TEST_CONTENT)
 
     print()
@@ -928,30 +631,36 @@ def main() -> None:
     print("=" * 72)
     print()
     print("核心变更：")
-    print("  core/task/storage.py")
-    print("    · SQLite 后端（tasks.db），零外部依赖")
-    print("    · WAL 模式 + busy_timeout=5000（多进程安全）")
-    print("    · 所有写操作走 BEGIN IMMEDIATE 事务（原子性）")
-    print("    · 未知字段落 extra 列（JSON），load 时 merge")
-    print("    · 日志迁移到 task_logs 表（按 task_id + id 索引）")
-    print("    · 新增 recover_orphan_tasks()（崩溃恢复）")
-    print("    · __init__ 自动迁移 status_dir/*.json → .migrated/")
-    print("    · 公开方法签名与旧版完全一致（零调用方改动）")
+    print("  core/excel_helpers.py")
+    print("    · 新增 _validate_xlsx()：文件头 + ZIP 结构 + openpyxl 尺寸检查")
+    print("    · normalize_excel_file 对有效 .xlsx 直接 return filepath（零复制）")
+    print("    · 尺寸超限时立即抛异常，不走 pandas 兜底（避免 OOM）")
+    print("    · 损坏 .xlsx / .xls / .xlsm 仍走原有转换路径")
     print()
-    print("  tests/test_core_task.py  (重写)")
-    print("    · 保留原有 8 个测试")
-    print("    · 新增：extra 合并、日志隔离、日志 limit、WAL 校验")
-    print("    · 新增：崩溃恢复、并发更新不丢数据、JSON 迁移（含损坏文件）")
-    print("    · 新增：manager 与 recover 联动")
+    print("  tests/test_excel_helpers.py  (重写)")
+    print("    · 有效 .xlsx 返回原路径 + 内容完整")
+    print("    · 有效 .xlsx 不创建任何 normalized_*.xlsx")
+    print("    · 多次调用不累积临时文件")
+    print("    · 边界值（== 上限）返回原路径")
+    print("    · 损坏 .xlsx 不返回原路径")
+    print("    · 尺寸超限抛异常 + 无临时文件残留")
+    print()
+    print("调用点零改动说明：")
+    print("  · blueprints/calculator.py::ensure_excel_compatible")
+    print("      返回值可能是原路径；process 的 finally 会删除它")
+    print("      （相当于用完后清掉上传文件，行为与旧版一致）")
+    print("  · services/excel/calculator_processor.py::_get_work_filepath")
+    print("      已有 `!= self.original_filepath` 判断，不会误删原文件")
+    print()
+    print("预期收益：")
+    print("  · 一次 /calc/process 请求的临时文件从 2 个降为 0 个")
+    print("  · 磁盘 IO 减少约 60~70%（省去两次全量复制 + 两次回读）")
+    print("  · .xls / 损坏文件行为完全不变")
     print()
     print("下一步（由你手动执行）：")
-    print("    python -m pytest tests/test_core_task.py -v")
-    print("    python -m pytest tests/test_integration_checker.py tests/test_integration_convert.py tests/test_integration_subtotal.py -v")
+    print("    python -m pytest tests/test_excel_helpers.py -v")
+    print("    python -m pytest tests/test_integration_calculator.py -v")
     print("    python -m pytest tests/ -v")
-    print()
-    print("建议后续小步骤（本次未做）：")
-    print("  · app.py::create_app 中调用 container.task_storage().recover_orphan_tasks()")
-    print("    （可选：接入 P1-2 DI 容器重构时一起做）")
 
 
 if __name__ == "__main__":

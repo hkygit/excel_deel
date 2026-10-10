@@ -1,9 +1,15 @@
 """
-Excel 文件辅助函数
+Excel 文件辅助函数。
+
+P0 变更：
+- normalize_excel_file 对已经是有效 .xlsx 的文件直接返回原路径，
+  避免无意义的"复制到临时文件再读回"。
+- 新增 _validate_xlsx 做轻量校验（文件头 + ZIP 结构 + openpyxl 尺寸检查）。
 """
 import os
 import logging
 import tempfile
+import zipfile
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
@@ -32,12 +38,7 @@ class ExcelNormalizationError(ValueError):
 
 def _check_size_limits(rows: int, cols: int, sheet_label: str,
                        max_rows: int, max_cols: int) -> None:
-    """
-    检查工作表尺寸是否超过上限，超过则抛 ExcelNormalizationError。
-
-    这里刻意采用「抛异常」策略，而不是「静默截断」——
-    静默截断会造成用户数据丢失而不被察觉，属于数据完整性事故。
-    """
+    """尺寸超限时抛 ExcelNormalizationError。"""
     if rows and rows > max_rows:
         raise ExcelNormalizationError(
             f"{sheet_label} 行数 {rows:,} 超过上限 {max_rows:,}；"
@@ -52,49 +53,111 @@ def _check_size_limits(rows: int, cols: int, sheet_label: str,
         )
 
 
+def _validate_xlsx(filepath: str, max_rows: int, max_cols: int) -> bool:
+    """快速校验 .xlsx 是否有效且尺寸合规。
+
+    返回:
+        True  - 文件有效且尺寸合规（可安全地返回原路径）
+        False - 文件无效（需走转换路径）
+    抛出:
+        ExcelNormalizationError - 尺寸超限（不进入转换路径）
+
+    不创建任何临时文件，不修改原文件。
+    """
+    # 1) 文件头检查（ZIP magic）
+    try:
+        with open(filepath, 'rb') as f:
+            if f.read(4) != b'PK\x03\x04':
+                return False
+    except OSError:
+        return False
+
+    # 2) ZIP 结构检查（比 openpyxl 更轻量，不解析样式 / 关系）
+    try:
+        with zipfile.ZipFile(filepath, 'r') as zf:
+            names = zf.namelist()
+            # 有效 xlsx 至少包含 xl/ 目录下的内容
+            if not any(n.startswith('xl/') for n in names):
+                return False
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+    # 3) openpyxl 打开 + 尺寸检查（read_only 模式下 max_row / max_column
+    #    从 XML 元数据读取，不会真的全量扫描单元格）
+    try:
+        wb = load_workbook(
+            filename=filepath,
+            data_only=True,
+            read_only=True,
+            keep_vba=False,
+        )
+    except Exception:
+        return False
+
+    try:
+        for ws in wb.worksheets:
+            rows = ws.max_row or 0
+            cols = ws.max_column or 0
+            if rows > max_rows or cols > max_cols:
+                _check_size_limits(
+                    rows, cols,
+                    sheet_label=f"工作表 '{ws.title}'",
+                    max_rows=max_rows, max_cols=max_cols,
+                )
+    finally:
+        wb.close()
+
+    return True
+
+
 def normalize_excel_file(
     filepath: str,
     max_rows: int = MAX_EXCEL_ROWS,
     max_cols: int = MAX_EXCEL_COLS,
 ) -> str:
-    """
-    将 Excel 文件标准化为 .xlsx 格式。
+    """确保文件是可被下游正常读写的 .xlsx。
 
-    与旧版相比的重要变化：
-    - 移除了原先的静默截断（100000 行 / 100 列上限）
-    - 当文件超出 max_rows / max_cols 时，抛出 ExcelNormalizationError
-    - 正常路径下完整复制所有行、列，不再丢数据
+    P0 语义变化：
+    - 对**有效的 .xlsx**：直接返回原路径（零复制），调用方需保证只读不改
+    - 对 .xls / .xlsm / 损坏 .xlsx：走转换路径，返回新的临时文件
+    - 尺寸超限：抛 ExcelNormalizationError（不静默截断）
 
     Args:
-        filepath: 原始 Excel 文件路径。
-        max_rows: 单表允许的最大行数（默认 Excel 硬限制 1,048,576）。
-        max_cols: 单表允许的最大列数（默认 Excel 硬限制 16,384）。
+        filepath: 原始文件路径
+        max_rows: 单表允许的最大行数（默认 Excel 硬限制）
+        max_cols: 单表允许的最大列数（默认 Excel 硬限制）
 
     Returns:
-        规范化后的临时 .xlsx 文件路径。
+        可安全读写的 .xlsx 路径（可能是原路径，也可能是新的临时文件）
 
     Raises:
-        FileNotFoundError: 源文件不存在。
-        ExcelNormalizationError: 超过行/列上限。
-        ValueError: 所有读取方式都失败。
+        FileNotFoundError: 源文件不存在
+        ExcelNormalizationError: 超过行/列上限
+        ValueError: 所有读取方式都失败
     """
-    # 检查文件是否存在
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"文件不存在: {filepath}")
 
     ext = os.path.splitext(filepath)[1].lower()
 
+    # ===== P0：有效 .xlsx 直接返回原路径，零复制 =====
     if ext == '.xlsx':
         try:
-            with open(filepath, 'rb') as f:
-                header = f.read(4)
-                if header != b'PK\x03\x04':
-                    logger.warning(
-                        f"文件 {filepath} 不是有效的ZIP文件，可能是损坏的Excel文件"
-                    )
-        except Exception as e:
-            logger.warning(f"检查文件失败: {e}")
+            if _validate_xlsx(filepath, max_rows, max_cols):
+                logger.info(
+                    f"文件已是有效 .xlsx，直接使用原路径: {filepath}"
+                )
+                return filepath
+        except ExcelNormalizationError:
+            # 尺寸超限：立即向上抛，**不走转换路径**
+            # 原因：pandas / openpyxl 的全量读更容易 OOM，及早拦截更安全
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f".xlsx 有效性检测异常，降级为转换路径: {e}"
+            )
 
+    # ===== 以下为需要转换的场景（.xls / .xlsm / 损坏 .xlsx）=====
     temp_dir = tempfile.gettempdir()
     base_name = os.path.basename(filepath)
     output_name = (
@@ -106,46 +169,40 @@ def normalize_excel_file(
         if path and os.path.exists(path):
             try:
                 os.unlink(path)
-            except Exception as cleanup_err:
+            except Exception as cleanup_err:  # noqa: BLE001
                 logger.debug(f"清理临时文件失败: {path} - {cleanup_err}")
 
     try:
-        # 方法1: 首先尝试用 openpyxl 读取
+        # 方法1: 用 openpyxl 读取并另存
         try:
             logger.info(f"尝试用openpyxl读取文件: {filepath}")
             wb = load_workbook(
                 filename=filepath,
                 data_only=True,
-                read_only=True,      # 只读模式，减小内存占用
+                read_only=True,
                 keep_vba=False,
             )
 
-            # === 关键改动 1：先检查上限，再决定是否处理 ===
-            # 在 read_only 模式下，max_row / max_column 来自文件元数据，
-            # 不需要真正加载全部单元格即可获得，可提前拦截超大文件。
+            # 尺寸检查（覆盖 .xls / .xlsm 等 _validate_xlsx 未校验的场景）
             for ws in wb.worksheets:
                 rows = ws.max_row or 0
                 cols = ws.max_column or 0
                 if rows > max_rows or cols > max_cols:
                     wb.close()
                     _safe_unlink(output_path)
-                    # 抛出异常（不会进入 pandas 回退）
                     _check_size_limits(
                         rows, cols,
                         sheet_label=f"工作表 '{ws.title}'",
                         max_rows=max_rows, max_cols=max_cols,
                     )
 
-            # 创建新的工作簿用于写入
+            # 完整复制所有行列（read_only 模式下用 iter_rows 最快）
             from openpyxl import Workbook
             wb_new = Workbook()
-            wb_new.remove(wb_new.active)  # 删除默认的工作表
+            wb_new.remove(wb_new.active)
 
-            # === 关键改动 2：完整复制所有行列，不再截断 ===
             for ws in wb.worksheets:
                 ws_new = wb_new.create_sheet(title=ws.title)
-                # iter_rows(values_only=True) 是 read_only 模式下的推荐迭代方式，
-                # 相比 cell-by-cell 访问更快、内存更省。
                 for row in ws.iter_rows(values_only=True):
                     ws_new.append(list(row))
 
@@ -157,13 +214,11 @@ def normalize_excel_file(
             return output_path
 
         except ExcelNormalizationError:
-            # 尺寸超限属于「不可恢复」错误，直接向上传播，禁止回退到 pandas
-            # （pandas 会把整个文件读入内存，反而更危险）
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"openpyxl 转换失败: {e}，回退到 pandas 方式")
 
-            # 方法2: 使用 pandas 读取（对损坏文件 / 老格式的兜底）
+            # 方法2: pandas 兜底
             try:
                 engine = None
                 if ext in ['.xls', '.xlsm']:
@@ -171,13 +226,12 @@ def normalize_excel_file(
 
                 df = pd.read_excel(
                     filepath,
-                    dtype=str,          # 全部作为字符串读取
-                    na_filter=False,    # 不过滤空值
+                    dtype=str,
+                    na_filter=False,
                     engine=engine,
-                    header=None,        # 不指定标题行
+                    header=None,
                 )
 
-                # === 关键改动 3：pandas 分支同样检查上限 ===
                 n_rows = df.shape[0]
                 n_cols = df.shape[1]
                 if n_rows > max_rows or n_cols > max_cols:
@@ -190,9 +244,7 @@ def normalize_excel_file(
 
                 df = df.fillna('')
                 df.to_excel(
-                    output_path,
-                    index=False,
-                    header=False,
+                    output_path, index=False, header=False,
                     engine='openpyxl',
                 )
 
@@ -201,10 +253,10 @@ def normalize_excel_file(
 
             except ExcelNormalizationError:
                 raise
-            except Exception as pd_e:
+            except Exception as pd_e:  # noqa: BLE001
                 logger.error(f"pandas 读取也失败: {pd_e}")
 
-                # 方法3: 生成一个说明性的空文件（保留原有兜底行为）
+                # 方法3: 生成占位文件（保留原有兜底行为）
                 try:
                     from openpyxl import Workbook
                     wb = Workbook()
@@ -215,7 +267,7 @@ def normalize_excel_file(
                     wb.save(output_path)
                     logger.warning(f"创建了空的修复文件: {output_path}")
                     return output_path
-                except Exception as create_e:
+                except Exception as create_e:  # noqa: BLE001
                     logger.error(f"创建修复文件也失败: {create_e}")
                     raise ValueError(
                         f"无法读取或转换 Excel 文件。请确保文件是有效的 Excel 文件。"
@@ -228,26 +280,22 @@ def normalize_excel_file(
         raise
 
 
-def safe_cleanup_dataframe(df: pd.DataFrame, auto_convert_numeric: bool = True) -> pd.DataFrame:
-    """
-    安全清理 DataFrame
-    """
+def safe_cleanup_dataframe(df: pd.DataFrame,
+                           auto_convert_numeric: bool = True) -> pd.DataFrame:
+    """安全清理 DataFrame。"""
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
 
     for col in df.columns:
-        # 清理字符串
         if df[col].dtype == 'object':
             df[col] = df[col].astype(str).str.strip()
-            # 将空字符串转为空值
             df[col] = df[col].replace('', pd.NA)
             df[col] = df[col].replace('nan', pd.NA)
             df[col] = df[col].replace('None', pd.NA)
             df[col] = df[col].replace('null', pd.NA)
 
-        # 自动转换数值
         if auto_convert_numeric and df[col].dtype == 'object':
             try:
                 numeric_series = pd.to_numeric(df[col], errors='coerce')
@@ -260,11 +308,9 @@ def safe_cleanup_dataframe(df: pd.DataFrame, auto_convert_numeric: bool = True) 
 
 
 def build_column_name_mapping(ws, header_row: int):
-    """
-    构建列名到列索引的映射
-    """
+    """构建列名到列索引的映射。"""
     mapping = {}
-    max_col = min(ws.max_column, 100)  # 限制列数
+    max_col = min(ws.max_column, 100)
 
     for col_idx in range(1, max_col + 1):
         cell = ws.cell(row=header_row, column=col_idx)
@@ -277,9 +323,7 @@ def build_column_name_mapping(ws, header_row: int):
 
 
 def safe_get_cell_value(ws, row: int, col: int):
-    """
-    安全获取单元格值
-    """
+    """安全获取单元格值。"""
     try:
         if row > ws.max_row or col > ws.max_column:
             return None
@@ -290,20 +334,16 @@ def safe_get_cell_value(ws, row: int, col: int):
 
 
 def safe_write_cell(ws, row: int, col: int, value):
-    """
-    安全写入单元格值
-    """
+    """安全写入单元格值。"""
     try:
         cell = ws.cell(row=row, column=col)
         cell.value = value
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"写入单元格失败 ({row}, {col}): {e}")
 
 
 def clear_merges_in_column(ws, col_idx: int):
-    """
-    清除指定列的合并单元格
-    """
+    """清除指定列的合并单元格。"""
     try:
         ranges_to_remove = []
         for merged_range in ws.merged_cells.ranges:
@@ -312,14 +352,12 @@ def clear_merges_in_column(ws, col_idx: int):
 
         for range_str in ranges_to_remove:
             ws.unmerge_cells(range_str)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"清除合并单元格失败: {e}")
 
 
 def safe_delete_file(filepath: str, max_retries: int = 3):
-    """
-    安全删除文件，处理文件被占用的情况
-    """
+    """安全删除文件，处理文件被占用的情况。"""
     if not filepath or not os.path.exists(filepath):
         return True
 
@@ -331,11 +369,11 @@ def safe_delete_file(filepath: str, max_retries: int = 3):
         except PermissionError as e:
             if i < max_retries - 1:
                 import time
-                time.sleep(0.1 * (i + 1))  # 指数退避
+                time.sleep(0.1 * (i + 1))
                 continue
             logger.warning(f"删除文件失败(被占用): {filepath}, 错误: {e}")
             return False
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"删除文件失败: {filepath}, 错误: {e}")
             return False
 
