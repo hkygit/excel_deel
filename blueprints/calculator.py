@@ -114,7 +114,8 @@ def process():
                 expression=expression,
                 result_col_input=result_col,
                 merge_by_cols_str=merge_by_cols,
-                compute_engine=compute_engine
+                compute_engine=compute_engine,
+                already_normalized=True,
             )
             result_path = processor.process()
 
@@ -137,7 +138,8 @@ def process():
                 agg_cols_raw=agg_cols_raw,
                 agg_func=agg_func,
                 result_col_input=result_col,
-                compute_engine=compute_engine
+                compute_engine=compute_engine,
+                already_normalized=True,
             )
             result_path = processor.process()
 

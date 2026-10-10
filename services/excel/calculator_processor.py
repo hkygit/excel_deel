@@ -28,13 +28,17 @@ logger = logging.getLogger(__name__)
 class BaseExcelProcessor(ABC):
     """Excel 处理器基类，封装公共的写入逻辑"""
 
-    def __init__(self, filepath: str, header_row: int, compute_engine):
+    def __init__(self, filepath: str, header_row: int, compute_engine,
+                 already_normalized: bool = False):
         self.original_filepath = filepath
         self.header_row = header_row
         self.compute_engine = compute_engine
         self.dal = get_data_access_layer()
         self.temp_files = []  # 跟踪所有临时文件
         self._work_filepath = None
+        # P0-2: 上游（blueprints/*.py）若已调用 normalize_excel_file，
+        # 应显式传入 already_normalized=True，避免重复规范化。
+        self.already_normalized = already_normalized
 
         # 注册清理函数
         atexit.register(self._cleanup_all)
@@ -52,7 +56,10 @@ class BaseExcelProcessor(ABC):
 
     def _get_work_filepath(self) -> str:
         """
-        获取工作文件路径，确保文件可读
+        获取工作文件路径，确保文件可读。
+
+        P0-2: 上游若已通过 already_normalized=True 声明文件已规范化，
+        则直接复用原路径，跳过二次 normalize（消除一次完整读写）。
         """
         if self._work_filepath and os.path.exists(self._work_filepath):
             return self._work_filepath
@@ -61,11 +68,26 @@ class BaseExcelProcessor(ABC):
         if not os.path.exists(self.original_filepath):
             raise FileNotFoundError(f"原始文件不存在: {self.original_filepath}")
 
-        # 总是进行规范化，确保文件格式正确
+        # P0-2: 上游已规范化的路径直接复用，零复制
+        if self.already_normalized:
+            if not self.original_filepath.lower().endswith('.xlsx'):
+                # 上游声明"已规范化"但扩展名不是 .xlsx —— 保守回退到 normalize
+                logger.warning(
+                    f"already_normalized=True 但文件不是 .xlsx "
+                    f"({self.original_filepath})，回退到 normalize_excel_file"
+                )
+            else:
+                self._work_filepath = self.original_filepath
+                logger.debug(
+                    f"已规范化，直接复用原路径: {self.original_filepath}"
+                )
+                return self._work_filepath
+
+        # 兜底路径：独立调用（未声明 already_normalized）时做完整规范化
         try:
             self._work_filepath = normalize_excel_file(self.original_filepath)
             if self._work_filepath and os.path.exists(self._work_filepath):
-                # 记录临时文件以便后续清理
+                # 记录临时文件以便后续清理（仅当确实新建了临时文件）
                 if self._work_filepath != self.original_filepath:
                     self.temp_files.append(self._work_filepath)
                 return self._work_filepath
@@ -170,8 +192,10 @@ class ColumnCalculatorProcessor(BaseExcelProcessor):
     """列计算处理器"""
 
     def __init__(self, filepath: str, header_row: int, expression: str,
-                 result_col_input: str, merge_by_cols_str: str, compute_engine):
-        super().__init__(filepath, header_row, compute_engine)
+                 result_col_input: str, merge_by_cols_str: str, compute_engine,
+                 already_normalized: bool = False):
+        super().__init__(filepath, header_row, compute_engine,
+                         already_normalized=already_normalized)
         self.expression = expression
         self.result_col_input = result_col_input
         self.merge_by_cols = [c.strip() for c in merge_by_cols_str.split(',') if c.strip()] if merge_by_cols_str else []
@@ -337,8 +361,10 @@ class AggregateBackfillProcessor(BaseExcelProcessor):
 
     def __init__(self, filepath: str, header_row: int,
                  group_cols_raw: List[str], agg_cols_raw: List[str],
-                 agg_func: str, result_col_input: str, compute_engine):
-        super().__init__(filepath, header_row, compute_engine)
+                 agg_func: str, result_col_input: str, compute_engine,
+                 already_normalized: bool = False):
+        super().__init__(filepath, header_row, compute_engine,
+                         already_normalized=already_normalized)
         self.group_cols_raw = group_cols_raw
         self.agg_cols_raw = agg_cols_raw
         self.agg_func = agg_func
