@@ -66,6 +66,7 @@ env/
 *.old
 
 uploads/
+数据操作目录/
 outputs/
 task_status/
 logs/

@@ -1,4 +1,39 @@
 #!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# 环境守卫：强制切到项目 .venv
+# 无论用哪个 python 启动（全局 Python、别的项目 venv、IDE 里选的），
+# 都先切到 E:\project\.venv\Scripts\python.exe 再执行。
+# ---------------------------------------------------------------------------
+import os as _os
+import sys as _sys
+import subprocess as _subprocess
+from pathlib import Path as _Path
+
+_PROJECT_ROOT = _Path(__file__).resolve().parent
+_VENV_PY = _PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+
+if _VENV_PY.exists():
+    try:
+        _current = _Path(_sys.executable).resolve()
+        _target = _VENV_PY.resolve()
+        if _current != _target:
+            print(f"[环境切换] {_current} → {_target}")
+            _sys.stdout.flush()
+            _env = _os.environ.copy()
+            _env.pop("PYTHONPATH", None)
+            _env.pop("PYTHONHOME", None)
+            _env["PATH"] = _os.pathsep.join(
+                p for p in _env.get("PATH", "").split(_os.pathsep)
+                if not (".venv" in p.lower() and "scripts" in p.lower()
+                        and str(_PROJECT_ROOT).lower() not in p.lower())
+            )
+            _sys.exit(_subprocess.run(
+                [str(_target), str(_Path(__file__).resolve())] + _sys.argv[1:],
+                env=_env,
+            ).returncode)
+    except OSError:
+        pass
+# ---------------------------------------------------------------------------
 import os, logging, threading, time
 from flask import Flask, render_template, request, g
 from werkzeug.exceptions import HTTPException, NotFound
