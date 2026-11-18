@@ -147,6 +147,13 @@ def create_app():
         cleanup_thread.start()
         logger.info("已启动后台清理线程")
 
+    # 修复 #2: 服务启动时恢复孤儿任务（pending/running → failed）
+    try:
+        container.task_storage().recover_orphan_tasks()
+        logger.info("孤儿任务恢复完成")
+    except Exception as e:
+        logger.warning(f"恢复孤儿任务失败: {e}")
+
     return app
 
 app = create_app()
@@ -157,7 +164,7 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT', 5000))
         logger.info(f"启动服务...端口 {port}")
         serve(app, host='127.0.0.1', port=port,
-              max_request_body_size=2*1024*1024*1024,
+              max_request_body_size=2 * 1024 * 1024 * 1024,
               channel_timeout=3600, connection_limit=100,
               clear_untrusted_proxy_headers=True, _quiet=False)
     except Exception as e:

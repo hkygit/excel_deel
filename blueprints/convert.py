@@ -38,15 +38,28 @@ def process():
             task_storage = app.container.task_storage()
             def progress_cb(**kw):
                 task_storage.update(task_id, **kw)
-            service = ConvertService(
-                file_path=save_path,
-                target_format=target_fmt,
-                encoding=encoding,
-                separator=separator,
-                progress_callback=progress_cb
-            )
-            result_path = service.execute()
-            return {'result_path': result_path, 'completed_at': pd.Timestamp.now().isoformat()}
+            try:
+                service = ConvertService(
+                    file_path=save_path,
+                    target_format=target_fmt,
+                    encoding=encoding,
+                    separator=separator,
+                    progress_callback=progress_cb
+                )
+                result_path = service.execute()
+                return {'result_path': result_path, 'completed_at': pd.Timestamp.now().isoformat()}
+            finally:
+                # 修复 #7: 闭包内清理临时文件和目录
+                try:
+                    if os.path.exists(save_path):
+                        os.remove(save_path)
+                except Exception:
+                    logger.warning(f"清理临时文件失败: {save_path}")
+                try:
+                    import shutil
+                    shutil.rmtree(upload_dir, ignore_errors=True)
+                except Exception:
+                    logger.warning(f"清理临时目录失败: {upload_dir}")
 
     result = run_conversion()
     return make_response(True, {'task_id': result['task_id']})
@@ -69,7 +82,6 @@ def download(task_id):
     if not path or not os.path.exists(path):
         return make_response(False, None, '文件不存在', 404)
     basename = os.path.basename(path)
-    # 统一命名：convert_原始文件名_转换结果.扩展名
     original = data.get('original_filename', 'file')
     safe_name = generate_output_filename('convert', original, suffix='_转换结果')
     return send_file(path, as_attachment=True, download_name=safe_name)

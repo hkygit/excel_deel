@@ -23,8 +23,10 @@ class ConvertService(Task):
             from openpyxl import load_workbook
             wb = load_workbook(self.file_path, read_only=True)
             rows = sum(ws.max_row - 1 for ws in wb.worksheets)
+            # 修复 #6: 在 close 前获取 sheetnames 长度，避免 close 后访问不可用的属性
+            sheets_count = len(wb.sheetnames)
             wb.close()
-            return {"type": "excel", "sheets": len(wb.sheetnames), "total_rows": rows}
+            return {"type": "excel", "sheets": sheets_count, "total_rows": rows}
         else:
             size = os.path.getsize(self.file_path)
             return {"type": "csv", "total_rows": max(size // 200, 1)}
