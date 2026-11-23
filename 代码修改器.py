@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-matcher 性能优化脚本（4+1）
+matcher 目标键重复处理方式优化脚本
 
-改动概览：
-1. _generate_report: set(target_keys_used) 提到循环外（修复 O(S*R) ≈ 2.2e9 次哈希）
-2. _generate_report: 新增 target_keys_full 参数，match() 复用已算好的 target_keys
-3. _extract_target_keys: key 列不在合并区间时走 ws.cell().value 快速路径
-4. _write_result_columns / _generate_report: Alignment 对象提到循环外复用
-5. 新增 generate_report 开关（默认 True），配合蓝图表单参数控制
+新增 duplicate_action 三值参数（error/first/all），兼容旧 allow_duplicate_keys。
 
-同时修改：
-- blueprints/matcher.py: process 路由支持 generate_report 表单参数
-- tests/test_integration_matcher.py: 追加 2 个新测试（开关打开/关闭）
+改动文件：
+1. services/excel/matcher.py        完整覆写（4 处改动）
+2. blueprints/matcher.py            精确替换（新增 _resolve_duplicate_action + process/debug 各 2 处）
+3. templates/matcher/index.html     checkbox → select（1 处）
+4. tests/test_integration_matcher.py 追加 1 fixture + 4 测试
 
 本脚本不运行测试。运行后请手动: python run_tests.py
 """
@@ -20,14 +17,14 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-
 MATCHER_PY = PROJECT_ROOT / "services" / "excel" / "matcher.py"
 BLUEPRINT_PY = PROJECT_ROOT / "blueprints" / "matcher.py"
+TEMPLATE_PY = PROJECT_ROOT / "templates" / "matcher" / "index.html"
 TEST_PY = PROJECT_ROOT / "tests" / "test_integration_matcher.py"
 
 
 # ============================================================================
-# services/excel/matcher.py 完整新内容
+# 1. services/excel/matcher.py 完整内容
 # ============================================================================
 MATCHER_CONTENT = r'''import os
 import pandas as pd
@@ -50,7 +47,21 @@ class ExcelMatcher:
         self.target_ws = None
         self.source_df = None
         self.data_reader = data_reader or DataReader()
-        self.allow_duplicate_keys = config.get('allow_duplicate_keys', False)
+
+        # 解析 duplicate_action（新参数），并与旧参数 allow_duplicate_keys 兼容
+        # 优先级：duplicate_action 合法值 > allow_duplicate_keys=True → 'first' > 'error'
+        _action = config.get('duplicate_action', '')
+        if isinstance(_action, str):
+            _action = _action.strip().lower()
+        if _action not in ('error', 'first', 'all'):
+            if config.get('allow_duplicate_keys'):
+                _action = 'first'
+            else:
+                _action = 'error'
+        self.duplicate_action = _action
+        # 向后兼容：保留旧属性名，供外部潜在读取（内部逻辑统一用 duplicate_action）
+        self.allow_duplicate_keys = (_action != 'error')
+
         # 优化 5：校验报告开关，默认开启（向后兼容）
         self.generate_report = config.get('generate_report', True)
 
@@ -248,10 +259,13 @@ class ExcelMatcher:
                 self.target_ws.unmerge_cells(str(merged))
 
         # 写入数据
-        seen_keys = set()
+        # duplicate_action='first'：跳过重复键，仅填充第一个匹配行（其余行保留原值）
+        # duplicate_action='all'  ：不跳过，所有匹配行都填充相同值
+        # duplicate_action='error'：match() 已提前报错，正常不会走到重复键分支
+        seen_keys = set() if self.duplicate_action == 'first' else None
         for row_offset, key in enumerate(keys):
             row_num = start_row + row_offset
-            if self.allow_duplicate_keys:
+            if seen_keys is not None:
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
@@ -375,11 +389,11 @@ class ExcelMatcher:
 
         target_keys, start_row, end_row = self._extract_target_keys()
 
-        if not self.allow_duplicate_keys:
+        if self.duplicate_action == 'error':
             duplicates = self._check_duplicate_target_keys(target_keys)
             if duplicates:
                 dup_examples = [f"'{k}'" for k in list(duplicates)[:5]]
-                self.errors.append(f"目标文件键列存在重复值: {', '.join(dup_examples)}。如需继续填充，请勾选“允许目标键重复”。")
+                self.errors.append(f"目标文件键列存在重复值: {', '.join(dup_examples)}。如需继续填充，请将'目标键重复时的处理方式'设为'只填充第一个'或'填充所有匹配行'。")
                 return False, self.errors
 
         lookup = self._build_lookup_dict()
@@ -451,130 +465,325 @@ class ExcelMatcher:
 
 
 # ============================================================================
-# blueprints/matcher.py 的精确字符串替换
+# 2. blueprints/matcher.py 精确替换锚点
 # ============================================================================
-BLUEPRINT_OLD = """    config = {
-        'target_key_cols': target_key_cols,
-        'source_match_cols': source_match_cols,
-        'source_value_cols': source_value_cols,
-        'result_cols': result_cols,
-        'allow_duplicate_keys': allow_duplicate_keys
-    }
+BP_A_OLD = r'''def _parse_multi_cols(raw: str) -> list:
+    if not raw:
+        return []
+    return split_fields(raw)
 
-    logger.info("[匹配填充] 开始执行 ExcelMatcher.match()")"""
 
-BLUEPRINT_NEW = """    config = {
+def _write_dataframe_to_worksheet(ws, df):'''
+
+BP_A_NEW = r'''def _parse_multi_cols(raw: str) -> list:
+    if not raw:
+        return []
+    return split_fields(raw)
+
+
+def _resolve_duplicate_action(form) -> str:
+    """解析目标键重复时的处理方式。
+
+    新参数 duplicate_action 优先：
+        - 'error'  : 检测到重复键时报错（默认）
+        - 'first'  : 只填充第一个匹配行，其余行保留原值
+        - 'all'    : 填充所有匹配行
+    兼容旧参数 allow_duplicate_keys='on' → 'first'（旧语义：只填第一个）
+    都未传时：'error'
+    """
+    action = (form.get('duplicate_action') or '').strip().lower()
+    if action in ('error', 'first', 'all'):
+        return action
+    if form.get('allow_duplicate_keys') == 'on':
+        return 'first'
+    return 'error'
+
+
+def _write_dataframe_to_worksheet(ws, df):'''
+
+BP_B_OLD = r'''    result_cols_raw = request.form.get('result_col', '').strip()
+    allow_duplicate_keys = request.form.get('allow_duplicate_keys') == 'on'
+
+    if not target_key_cols_raw or not source_match_cols_raw or not source_value_cols_raw or not result_cols_raw:
+        raise ValidationError('请填写完整配置项')'''
+
+BP_B_NEW = r'''    result_cols_raw = request.form.get('result_col', '').strip()
+    duplicate_action = _resolve_duplicate_action(request.form)
+
+    if not target_key_cols_raw or not source_match_cols_raw or not source_value_cols_raw or not result_cols_raw:
+        raise ValidationError('请填写完整配置项')'''
+
+BP_C_OLD = r'''    config = {
         'target_key_cols': target_key_cols,
         'source_match_cols': source_match_cols,
         'source_value_cols': source_value_cols,
         'result_cols': result_cols,
         'allow_duplicate_keys': allow_duplicate_keys,
         'generate_report': request.form.get('generate_report', 'on') != 'off',
-    }
+    }'''
 
-    logger.info("[匹配填充] 开始执行 ExcelMatcher.match()")"""
+BP_C_NEW = r'''    config = {
+        'target_key_cols': target_key_cols,
+        'source_match_cols': source_match_cols,
+        'source_value_cols': source_value_cols,
+        'result_cols': result_cols,
+        'duplicate_action': duplicate_action,
+        'generate_report': request.form.get('generate_report', 'on') != 'off',
+    }'''
+
+BP_D_OLD = r'''    result_cols_raw = request.form.get('result_col', '').strip()
+    allow_duplicate_keys = request.form.get('allow_duplicate_keys') == 'on'
+
+    if not target_key_cols_raw or not source_match_cols_raw or not source_value_cols_raw or not result_cols_raw:
+        return render_template('error.html', error='请填写完整配置项'), 400'''
+
+BP_D_NEW = r'''    result_cols_raw = request.form.get('result_col', '').strip()
+    duplicate_action = _resolve_duplicate_action(request.form)
+
+    if not target_key_cols_raw or not source_match_cols_raw or not source_value_cols_raw or not result_cols_raw:
+        return render_template('error.html', error='请填写完整配置项'), 400'''
+
+BP_E_OLD = r'''    config = {
+        'target_key_cols': target_key_cols,
+        'source_match_cols': source_match_cols,
+        'source_value_cols': source_value_cols,
+        'result_cols': result_cols,
+        'allow_duplicate_keys': allow_duplicate_keys
+    }'''
+
+BP_E_NEW = r'''    config = {
+        'target_key_cols': target_key_cols,
+        'source_match_cols': source_match_cols,
+        'source_value_cols': source_value_cols,
+        'result_cols': result_cols,
+        'duplicate_action': duplicate_action,
+    }'''
 
 
 # ============================================================================
-# tests/test_integration_matcher.py 的追加块
+# 3. templates/matcher/index.html 精确替换
 # ============================================================================
-TEST_ANCHOR_OLD = """        response = client.post('/match/debug', data=data, content_type='multipart/form-data')
+TPL_OLD = r'''        <div class="form-row">
+            <label>
+                <input type="checkbox" name="allow_duplicate_keys" id="allowDupKeys">
+                允许目标键重复（仅将源值填充到首次出现的行，其余行保持不变）
+            </label>
+        </div>'''
+
+TPL_NEW = r'''        <div class="form-row">
+            <label>目标键重复时的处理方式</label>
+            <select name="duplicate_action" id="duplicateAction">
+                <option value="error" selected>报错（检测到重复键时中止）</option>
+                <option value="first">只填充第一个匹配行（其余行保留原值）</option>
+                <option value="all">填充所有匹配行（每行都写入相同值）</option>
+            </select>
+            <div class="hint">
+                仅当目标文件的主键列存在重复值时生效。
+                "只填充第一个"适合一个 key 只对应一条业务的场景；
+                "填充所有"适合一个 key 对应多条业务记录的场景。
+            </div>
+        </div>'''
+
+
+# ============================================================================
+# 4. tests/test_integration_matcher.py 追加块
+# ============================================================================
+TEST_TAIL_OLD = r'''        response = client.post('/match/process', data=data, content_type='multipart/form-data')
         assert response.status_code == 200
-        content = response.data.decode('utf-8')
-        assert 'source_value_cols' in content or 'config' in content"""
+        xlsx = pd.ExcelFile(io.BytesIO(response.data))
+        assert '校验报告' in xlsx.sheet_names'''
 
-TEST_ANCHOR_NEW = TEST_ANCHOR_OLD + """
+TEST_TAIL_NEW = TEST_TAIL_OLD + r'''
 
-    def test_match_with_generate_report_off(self, client, target_file, source_file):
-        \"\"\"测试关闭校验报告开关：结果 xlsx 不应包含'校验报告' sheet\"\"\"
+    @pytest.fixture
+    def target_file_duplicate_unmatched(self):
+        """ID=99 出现两次但源里没有 99；ID=1 匹配。
+        用于验证 all 模式下未匹配重复行填 0（与 first 模式第 1 行一致）"""
+        wb = Workbook()
+        ws = wb.active
+        ws['A1'] = 'ID'
+        ws['B1'] = 'Value1'
+        ws['A2'] = 99
+        ws['B2'] = 'orig1'
+        ws['A3'] = 99
+        ws['B3'] = 'orig2'
+        ws['A4'] = 1
+        ws['B4'] = ''
+        f = io.BytesIO()
+        wb.save(f)
+        f.seek(0)
+        return f
+
+    def test_duplicate_action_first_explicit(self, client, target_file_duplicate, source_file):
+        """显式 duplicate_action='first'，行为应与 allow_duplicate_keys='on' 一致"""
         data = {
-            'target_file': (target_file, 'target.xlsx'),
+            'target_file': (target_file_duplicate, 'target_dup.xlsx'),
             'source_file': (source_file, 'source.xlsx'),
             'target_key_cols': 'A',
             'source_match_cols': 'A',
             'source_value_col': 'B',
             'result_col': 'B',
-            'generate_report': 'off',
+            'duplicate_action': 'first',
         }
         response = client.post('/match/process', data=data, content_type='multipart/form-data')
         assert response.status_code == 200
-        xlsx = pd.ExcelFile(io.BytesIO(response.data))
-        assert '校验报告' not in xlsx.sheet_names
+        result_df = pd.read_excel(io.BytesIO(response.data))
+        # 第 1 行（ID=1）填 100
+        assert result_df.loc[0, 'Value1'] == 100
+        # 第 2 行（ID=1，重复）保留原值（空）
+        assert result_df.loc[1, 'Value1'] == '' or pd.isna(result_df.loc[1, 'Value1'])
+        # 第 3 行（ID=2）填 200
+        assert result_df.loc[2, 'Value1'] == 200
 
-    def test_match_with_generate_report_default_on(self, client, target_file, source_file):
-        \"\"\"测试默认行为：不传 generate_report 时，应生成校验报告（向后兼容）\"\"\"
+    def test_duplicate_action_all(self, client, target_file_duplicate, source_file):
+        """duplicate_action='all'，所有匹配行都填充相同值"""
         data = {
-            'target_file': (target_file, 'target.xlsx'),
+            'target_file': (target_file_duplicate, 'target_dup.xlsx'),
             'source_file': (source_file, 'source.xlsx'),
             'target_key_cols': 'A',
             'source_match_cols': 'A',
             'source_value_col': 'B',
             'result_col': 'B',
+            'duplicate_action': 'all',
         }
         response = client.post('/match/process', data=data, content_type='multipart/form-data')
         assert response.status_code == 200
-        xlsx = pd.ExcelFile(io.BytesIO(response.data))
-        assert '校验报告' in xlsx.sheet_names"""
+        result_df = pd.read_excel(io.BytesIO(response.data))
+        # 两行 ID=1 都被填充 100
+        assert result_df.loc[0, 'Value1'] == 100
+        assert result_df.loc[1, 'Value1'] == 100
+        # 第 3 行（ID=2）填 200
+        assert result_df.loc[2, 'Value1'] == 200
+
+    def test_duplicate_action_all_with_unmatched(self, client, target_file_duplicate_unmatched, source_file):
+        """duplicate_action='all' 且重复 key 在源中无匹配：填 0（与 first 模式第 1 行一致）"""
+        data = {
+            'target_file': (target_file_duplicate_unmatched, 'target_dup_unmatched.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'all',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        result_df = pd.read_excel(io.BytesIO(response.data))
+        # ID=99 两行均未匹配，都填 0（覆盖原值 orig1/orig2）
+        assert result_df.loc[0, 'Value1'] == 0
+        assert result_df.loc[1, 'Value1'] == 0
+        # 第 3 行（ID=1）填 100
+        assert result_df.loc[2, 'Value1'] == 100
+
+    def test_duplicate_action_invalid_value(self, client, target_file_duplicate, source_file):
+        """非法 duplicate_action 值降级为 'error'，检测到重复键时报错"""
+        data = {
+            'target_file': (target_file_duplicate, 'target_dup.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'xxx',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 400
+        resp_json = response.get_json()
+        assert not resp_json['success']
+        assert '重复' in resp_json['error']'''
 
 
 # ============================================================================
 # 主流程
 # ============================================================================
+def _replace_once(src: str, old: str, new: str, desc: str) -> str:
+    """精确替换，锚点必须唯一，否则报错中止。"""
+    count = src.count(old)
+    if count == 0:
+        print(f"[ERROR] 未找到锚点: {desc}")
+        print("        请检查文件是否已被修改或内容不一致")
+        sys.exit(1)
+    if count > 1:
+        print(f"[ERROR] 锚点不唯一（找到 {count} 处）: {desc}")
+        print("        为避免误替换，已中止")
+        sys.exit(1)
+    return src.replace(old, new, 1)
+
+
 def write_matcher():
     if not MATCHER_PY.exists():
         print(f"[ERROR] 找不到 {MATCHER_PY}")
-        print("        请确认脚本放在项目根目录（与 app.py 同级）")
         sys.exit(1)
     MATCHER_PY.write_text(MATCHER_CONTENT, encoding='utf-8')
-    print(f"[OK] 已覆写 {MATCHER_PY}")
+    print(f"[OK] 已覆写 {MATCHER_PY.relative_to(PROJECT_ROOT)}")
 
 
 def patch_blueprint():
     if not BLUEPRINT_PY.exists():
-        print(f"[SKIP] {BLUEPRINT_PY} 不存在，跳过")
-        return
+        print(f"[ERROR] 找不到 {BLUEPRINT_PY}")
+        sys.exit(1)
     src = BLUEPRINT_PY.read_text(encoding='utf-8')
-    if "generate_report" in src:
-        print(f"[SKIP] {BLUEPRINT_PY} 已包含 generate_report，跳过")
+
+    if '_resolve_duplicate_action' in src:
+        print(f"[SKIP] {BLUEPRINT_PY.relative_to(PROJECT_ROOT)} 已包含 _resolve_duplicate_action")
         return
-    if BLUEPRINT_OLD not in src:
-        print(f"[WARN] {BLUEPRINT_PY} 未找到预期的 config 片段，跳过")
-        print("       请手动在 process 路由的 config 字典里加:")
-        print("         'generate_report': request.form.get('generate_report', 'on') != 'off',")
-        return
-    src = src.replace(BLUEPRINT_OLD, BLUEPRINT_NEW, 1)
+
+    src = _replace_once(src, BP_A_OLD, BP_A_NEW, "新增 _resolve_duplicate_action 函数")
+    src = _replace_once(src, BP_B_OLD, BP_B_NEW, "process 路由：解析 duplicate_action")
+    src = _replace_once(src, BP_C_OLD, BP_C_NEW, "process 路由：config 改用 duplicate_action")
+    src = _replace_once(src, BP_D_OLD, BP_D_NEW, "debug 路由：解析 duplicate_action")
+    src = _replace_once(src, BP_E_OLD, BP_E_NEW, "debug 路由：config 改用 duplicate_action")
+
     BLUEPRINT_PY.write_text(src, encoding='utf-8')
-    print(f"[OK] 已更新 {BLUEPRINT_PY}")
+    print(f"[OK] 已更新 {BLUEPRINT_PY.relative_to(PROJECT_ROOT)}（5 处替换）")
+
+
+def patch_template():
+    if not TEMPLATE_PY.exists():
+        print(f"[ERROR] 找不到 {TEMPLATE_PY}")
+        sys.exit(1)
+    src = TEMPLATE_PY.read_text(encoding='utf-8')
+
+    if 'name="duplicate_action"' in src:
+        print(f"[SKIP] {TEMPLATE_PY.relative_to(PROJECT_ROOT)} 已包含 duplicate_action")
+        return
+
+    src = _replace_once(src, TPL_OLD, TPL_NEW, "checkbox allow_duplicate_keys → select duplicate_action")
+    TEMPLATE_PY.write_text(src, encoding='utf-8')
+    print(f"[OK] 已更新 {TEMPLATE_PY.relative_to(PROJECT_ROOT)}")
 
 
 def patch_tests():
     if not TEST_PY.exists():
-        print(f"[SKIP] {TEST_PY} 不存在，跳过")
-        return
+        print(f"[ERROR] 找不到 {TEST_PY}")
+        sys.exit(1)
     src = TEST_PY.read_text(encoding='utf-8')
-    if "test_match_with_generate_report_off" in src:
-        print(f"[SKIP] {TEST_PY} 已包含新测试，跳过")
+
+    if 'test_duplicate_action_all' in src:
+        print(f"[SKIP] {TEST_PY.relative_to(PROJECT_ROOT)} 已包含新测试")
         return
-    if TEST_ANCHOR_OLD not in src:
-        print(f"[WARN] {TEST_PY} 未找到锚点（test_debug_mode_multiple_columns 的尾部），跳过")
-        print("       请手动追加 test_match_with_generate_report_off / default_on")
-        return
-    src = src.replace(TEST_ANCHOR_OLD, TEST_ANCHOR_NEW, 1)
+
+    src = _replace_once(
+        src, TEST_TAIL_OLD, TEST_TAIL_NEW,
+        "test_match_with_generate_report_default_on 尾部（追加新 fixture + 4 个测试）"
+    )
     TEST_PY.write_text(src, encoding='utf-8')
-    print(f"[OK] 已追加 2 个测试到 {TEST_PY}")
+    print(f"[OK] 已追加 1 fixture + 4 测试到 {TEST_PY.relative_to(PROJECT_ROOT)}")
 
 
 def main():
     print("=" * 60)
-    print("matcher 性能优化（4+1）")
+    print("matcher 目标键重复处理方式优化（duplicate_action）")
     print(f"项目根目录: {PROJECT_ROOT}")
     print("=" * 60)
     write_matcher()
     patch_blueprint()
+    patch_template()
     patch_tests()
     print("=" * 60)
-    print("完成。请手动运行: python run_tests.py")
-    print("或: .venv\\Scripts\\python.exe -m pytest tests/test_integration_matcher.py -v")
+    print("完成。请手动运行测试验证：")
+    print("  .venv\\Scripts\\python.exe -m pytest tests/test_integration_matcher.py -v")
+    print("  或: python run_tests.py")
 
 
 if __name__ == '__main__':

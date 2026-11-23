@@ -19,7 +19,21 @@ class ExcelMatcher:
         self.target_ws = None
         self.source_df = None
         self.data_reader = data_reader or DataReader()
-        self.allow_duplicate_keys = config.get('allow_duplicate_keys', False)
+
+        # 解析 duplicate_action（新参数），并与旧参数 allow_duplicate_keys 兼容
+        # 优先级：duplicate_action 合法值 > allow_duplicate_keys=True → 'first' > 'error'
+        _action = config.get('duplicate_action', '')
+        if isinstance(_action, str):
+            _action = _action.strip().lower()
+        if _action not in ('error', 'first', 'all'):
+            if config.get('allow_duplicate_keys'):
+                _action = 'first'
+            else:
+                _action = 'error'
+        self.duplicate_action = _action
+        # 向后兼容：保留旧属性名，供外部潜在读取（内部逻辑统一用 duplicate_action）
+        self.allow_duplicate_keys = (_action != 'error')
+
         # 优化 5：校验报告开关，默认开启（向后兼容）
         self.generate_report = config.get('generate_report', True)
 
@@ -217,10 +231,13 @@ class ExcelMatcher:
                 self.target_ws.unmerge_cells(str(merged))
 
         # 写入数据
-        seen_keys = set()
+        # duplicate_action='first'：跳过重复键，仅填充第一个匹配行（其余行保留原值）
+        # duplicate_action='all'  ：不跳过，所有匹配行都填充相同值
+        # duplicate_action='error'：match() 已提前报错，正常不会走到重复键分支
+        seen_keys = set() if self.duplicate_action == 'first' else None
         for row_offset, key in enumerate(keys):
             row_num = start_row + row_offset
-            if self.allow_duplicate_keys:
+            if seen_keys is not None:
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
@@ -344,11 +361,11 @@ class ExcelMatcher:
 
         target_keys, start_row, end_row = self._extract_target_keys()
 
-        if not self.allow_duplicate_keys:
+        if self.duplicate_action == 'error':
             duplicates = self._check_duplicate_target_keys(target_keys)
             if duplicates:
                 dup_examples = [f"'{k}'" for k in list(duplicates)[:5]]
-                self.errors.append(f"目标文件键列存在重复值: {', '.join(dup_examples)}。如需继续填充，请勾选“允许目标键重复”。")
+                self.errors.append(f"目标文件键列存在重复值: {', '.join(dup_examples)}。如需继续填充，请将'目标键重复时的处理方式'设为'只填充第一个'或'填充所有匹配行'。")
                 return False, self.errors
 
         lookup = self._build_lookup_dict()

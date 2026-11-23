@@ -45,10 +45,17 @@
             <div class="hint">输入列字母覆盖该列；输入其他新建列</div>
         </div>
         <div class="form-row">
-            <label>
-                <input type="checkbox" name="allow_duplicate_keys" id="allowDupKeys">
-                允许目标键重复（仅将源值填充到首次出现的行，其余行保持不变）
-            </label>
+            <label>目标键重复时的处理方式</label>
+            <select name="duplicate_action" id="duplicateAction">
+                <option value="error" selected>报错（检测到重复键时中止）</option>
+                <option value="first">只填充第一个匹配行（其余行保留原值）</option>
+                <option value="all">填充所有匹配行（每行都写入相同值）</option>
+            </select>
+            <div class="hint">
+                仅当目标文件的主键列存在重复值时生效。
+                "只填充第一个"适合一个 key 只对应一条业务的场景；
+                "填充所有"适合一个 key 对应多条业务记录的场景。
+            </div>
         </div>
     </div>
     <div class="button-group">

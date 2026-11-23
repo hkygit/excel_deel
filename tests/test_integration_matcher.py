@@ -203,3 +203,100 @@ class TestMatcherIntegration:
         assert response.status_code == 200
         xlsx = pd.ExcelFile(io.BytesIO(response.data))
         assert '校验报告' in xlsx.sheet_names
+
+    @pytest.fixture
+    def target_file_duplicate_unmatched(self):
+        """ID=99 出现两次但源里没有 99；ID=1 匹配。
+        用于验证 all 模式下未匹配重复行填 0（与 first 模式第 1 行一致）"""
+        wb = Workbook()
+        ws = wb.active
+        ws['A1'] = 'ID'
+        ws['B1'] = 'Value1'
+        ws['A2'] = 99
+        ws['B2'] = 'orig1'
+        ws['A3'] = 99
+        ws['B3'] = 'orig2'
+        ws['A4'] = 1
+        ws['B4'] = ''
+        f = io.BytesIO()
+        wb.save(f)
+        f.seek(0)
+        return f
+
+    def test_duplicate_action_first_explicit(self, client, target_file_duplicate, source_file):
+        """显式 duplicate_action='first'，行为应与 allow_duplicate_keys='on' 一致"""
+        data = {
+            'target_file': (target_file_duplicate, 'target_dup.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'first',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        result_df = pd.read_excel(io.BytesIO(response.data))
+        # 第 1 行（ID=1）填 100
+        assert result_df.loc[0, 'Value1'] == 100
+        # 第 2 行（ID=1，重复）保留原值（空）
+        assert result_df.loc[1, 'Value1'] == '' or pd.isna(result_df.loc[1, 'Value1'])
+        # 第 3 行（ID=2）填 200
+        assert result_df.loc[2, 'Value1'] == 200
+
+    def test_duplicate_action_all(self, client, target_file_duplicate, source_file):
+        """duplicate_action='all'，所有匹配行都填充相同值"""
+        data = {
+            'target_file': (target_file_duplicate, 'target_dup.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'all',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        result_df = pd.read_excel(io.BytesIO(response.data))
+        # 两行 ID=1 都被填充 100
+        assert result_df.loc[0, 'Value1'] == 100
+        assert result_df.loc[1, 'Value1'] == 100
+        # 第 3 行（ID=2）填 200
+        assert result_df.loc[2, 'Value1'] == 200
+
+    def test_duplicate_action_all_with_unmatched(self, client, target_file_duplicate_unmatched, source_file):
+        """duplicate_action='all' 且重复 key 在源中无匹配：填 0（与 first 模式第 1 行一致）"""
+        data = {
+            'target_file': (target_file_duplicate_unmatched, 'target_dup_unmatched.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'all',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        result_df = pd.read_excel(io.BytesIO(response.data))
+        # ID=99 两行均未匹配，都填 0（覆盖原值 orig1/orig2）
+        assert result_df.loc[0, 'Value1'] == 0
+        assert result_df.loc[1, 'Value1'] == 0
+        # 第 3 行（ID=1）填 100
+        assert result_df.loc[2, 'Value1'] == 100
+
+    def test_duplicate_action_invalid_value(self, client, target_file_duplicate, source_file):
+        """非法 duplicate_action 值降级为 'error'，检测到重复键时报错"""
+        data = {
+            'target_file': (target_file_duplicate, 'target_dup.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'xxx',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 400
+        resp_json = response.get_json()
+        assert not resp_json['success']
+        assert '重复' in resp_json['error']
