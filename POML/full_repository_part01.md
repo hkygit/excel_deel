@@ -2,7 +2,7 @@
 
 - **repository**: `project`
 - **export_filter**: `full_repository`
-- **total_files**: 174
+- **total_files**: 167
 
 ## Files
 
@@ -159,6 +159,13 @@ def create_app():
         cleanup_thread.start()
         logger.info("已启动后台清理线程")
 
+    # 修复 #2: 服务启动时恢复孤儿任务（pending/running → failed）
+    try:
+        container.task_storage().recover_orphan_tasks()
+        logger.info("孤儿任务恢复完成")
+    except Exception as e:
+        logger.warning(f"恢复孤儿任务失败: {e}")
+
     return app
 
 app = create_app()
@@ -169,7 +176,7 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT', 5000))
         logger.info(f"启动服务...端口 {port}")
         serve(app, host='127.0.0.1', port=port,
-              max_request_body_size=2*1024*1024*1024,
+              max_request_body_size=2 * 1024 * 1024 * 1024,
               channel_timeout=3600, connection_limit=100,
               clear_untrusted_proxy_headers=True, _quiet=False)
     except Exception as e:
@@ -395,20 +402,27 @@ def precheck():
     if not files_a or not files_b:
         raise ValidationError("请上传两批文件")
     saved_a, saved_b = [], []
-    for f in files_a:
-        if f.filename:
-            p = os.path.join(tempfile.gettempdir(), f"pre_{os.urandom(4).hex()}_{f.filename}")
-            f.save(p)
-            saved_a.append(p)
-    for f in files_b:
-        if f.filename:
-            p = os.path.join(tempfile.gettempdir(), f"pre_{os.urandom(4).hex()}_{f.filename}")
-            f.save(p)
-            saved_b.append(p)
-    svc = CheckerService(files_a=saved_a, files_b=saved_b, config=current_app.container.config.provided.checker())
-    res = svc.precheck()
-    for p in saved_a+saved_b: os.remove(p)
-    return make_response(True, res)
+    try:
+        for f in files_a:
+            if f.filename:
+                p = os.path.join(tempfile.gettempdir(), f"pre_{os.urandom(4).hex()}_{f.filename}")
+                f.save(p)
+                saved_a.append(p)
+        for f in files_b:
+            if f.filename:
+                p = os.path.join(tempfile.gettempdir(), f"pre_{os.urandom(4).hex()}_{f.filename}")
+                f.save(p)
+                saved_b.append(p)
+        svc = CheckerService(files_a=saved_a, files_b=saved_b, config=current_app.container.config.provided.checker())
+        res = svc.precheck()
+        return make_response(True, res)
+    finally:
+        # 修复 #7: 确保临时文件始终清理
+        for p in saved_a + saved_b:
+            try:
+                os.remove(p)
+            except Exception:
+                logger.warning(f"清理临时文件失败: {p}")
 
 @checker_bp.route('/process', methods=['POST'])
 @handle_exceptions()
@@ -429,13 +443,22 @@ def process():
             f.save(p)
             saved_b.append(p)
 
-    key_map_a = [k.strip() for k in request.form['key_map_a'].split(',') if k.strip()]
-    key_map_b_str = request.form.get('key_map_b','')
+    # 修复 #8: request.form['key_map_a'] → .get() + 校验
+    key_map_a_raw = request.form.get('key_map_a')
+    if not key_map_a_raw:
+        raise ValidationError("缺少主键列映射参数 key_map_a")
+    key_map_a = [k.strip() for k in key_map_a_raw.split(',') if k.strip()]
+
+    # 修复 #8: request.form['compare_map'] → .get() + 默认
+    compare_map = json.loads(request.form.get('compare_map', '[]'))
+
+    # 原始逻辑保留：key_map_b 空字符串 → key_map_a
+    key_map_b_str = request.form.get('key_map_b', '')
     key_map_b = [k.strip() for k in key_map_b_str.split(',') if k.strip()] if key_map_b_str else key_map_a
-    compare_map = json.loads(request.form['compare_map'])
-    filters_a = json.loads(request.form.get('filters_a','[]'))
-    filters_b = json.loads(request.form.get('filters_b','[]'))
-    dup_action = request.form.get('duplicate_action','error')
+
+    filters_a = json.loads(request.form.get('filters_a', '[]'))
+    filters_b = json.loads(request.form.get('filters_b', '[]'))
+    dup_action = request.form.get('duplicate_action', 'error')
 
     app = current_app._get_current_object()
     cfg = app.container.config.provided.checker()
@@ -448,16 +471,24 @@ def process():
             task_storage = app.container.task_storage()
             def progress_cb(**kw):
                 task_storage.update(task_id, **kw)
-            service = CheckerService(
-                files_a=saved_a, files_b=saved_b,
-                key_map_a=key_map_a, key_map_b=key_map_b,
-                compare_map=compare_map, filters_a=filters_a, filters_b=filters_b,
-                duplicate_action=dup_action, config=cfg,
-                progress_callback=progress_cb,
-                precheck_data=pre_data
-            )
-            result_path = service.execute()
-            return {'result_path': result_path, 'completed_at': pd.Timestamp.now().isoformat()}
+            try:
+                service = CheckerService(
+                    files_a=saved_a, files_b=saved_b,
+                    key_map_a=key_map_a, key_map_b=key_map_b,
+                    compare_map=compare_map, filters_a=filters_a, filters_b=filters_b,
+                    duplicate_action=dup_action, config=cfg,
+                    progress_callback=progress_cb,
+                    precheck_data=pre_data
+                )
+                result_path = service.execute()
+                return {'result_path': result_path, 'completed_at': pd.Timestamp.now().isoformat()}
+            finally:
+                # 修复 #7: 闭包内清理临时文件
+                for p in saved_a + saved_b:
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        logger.warning(f"清理临时文件失败: {p}")
 
     result = run_check()
     return make_response(True, {'task_id': result['task_id']})
@@ -478,7 +509,6 @@ def download(task_id):
     path = data['result_path']
     if not path or not os.path.exists(path):
         return make_response(False, None, '文件不存在', 404)
-    # 获取原始文件名用于生成下载名
     original_filename = data.get('original_filename', '校验结果.xlsx')
     download_name = generate_output_filename('checker', original_filename, suffix='_校验结果')
     return send_file(path, as_attachment=True, download_name=download_name)
@@ -629,15 +659,28 @@ def process():
             task_storage = app.container.task_storage()
             def progress_cb(**kw):
                 task_storage.update(task_id, **kw)
-            service = ConvertService(
-                file_path=save_path,
-                target_format=target_fmt,
-                encoding=encoding,
-                separator=separator,
-                progress_callback=progress_cb
-            )
-            result_path = service.execute()
-            return {'result_path': result_path, 'completed_at': pd.Timestamp.now().isoformat()}
+            try:
+                service = ConvertService(
+                    file_path=save_path,
+                    target_format=target_fmt,
+                    encoding=encoding,
+                    separator=separator,
+                    progress_callback=progress_cb
+                )
+                result_path = service.execute()
+                return {'result_path': result_path, 'completed_at': pd.Timestamp.now().isoformat()}
+            finally:
+                # 修复 #7: 闭包内清理临时文件和目录
+                try:
+                    if os.path.exists(save_path):
+                        os.remove(save_path)
+                except Exception:
+                    logger.warning(f"清理临时文件失败: {save_path}")
+                try:
+                    import shutil
+                    shutil.rmtree(upload_dir, ignore_errors=True)
+                except Exception:
+                    logger.warning(f"清理临时目录失败: {upload_dir}")
 
     result = run_conversion()
     return make_response(True, {'task_id': result['task_id']})
@@ -660,7 +703,6 @@ def download(task_id):
     if not path or not os.path.exists(path):
         return make_response(False, None, '文件不存在', 404)
     basename = os.path.basename(path)
-    # 统一命名：convert_原始文件名_转换结果.扩展名
     original = data.get('original_filename', 'file')
     safe_name = generate_output_filename('convert', original, suffix='_转换结果')
     return send_file(path, as_attachment=True, download_name=safe_name)

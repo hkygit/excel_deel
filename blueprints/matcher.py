@@ -211,7 +211,8 @@ def process():
         'source_match_cols': source_match_cols,
         'source_value_cols': source_value_cols,
         'result_cols': result_cols,
-        'allow_duplicate_keys': allow_duplicate_keys
+        'allow_duplicate_keys': allow_duplicate_keys,
+        'generate_report': request.form.get('generate_report', 'on') != 'off',
     }
 
     logger.info("[匹配填充] 开始执行 ExcelMatcher.match()")

@@ -1224,11 +1224,11 @@ class ConditionEngine:
         if op == '!=':  return cell != target
         if op == 'contains' or op == '包含': return target in cell
         if op == 'not_contains' or op == '不包含': return target not in cell
-        if op in ('>', '<', '>=', '<='):
-            try:
-                return eval(f'"{cell}" {op} "{target}"')
-            except:
-                return False
+        # 修复 #3: 删除 eval 注入风险，改为原生字符串比较
+        if op == '>':   return cell > target
+        if op == '<':   return cell < target
+        if op == '>=':  return cell >= target
+        if op == '<=':  return cell <= target
         return False
 
     def apply_to_row(self, row: Dict[str, str], exact: List[Dict], fuzzy: List[Dict]) -> bool:

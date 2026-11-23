@@ -20,6 +20,8 @@ class ExcelMatcher:
         self.source_df = None
         self.data_reader = data_reader or DataReader()
         self.allow_duplicate_keys = config.get('allow_duplicate_keys', False)
+        # 优化 5：校验报告开关，默认开启（向后兼容）
+        self.generate_report = config.get('generate_report', True)
 
         # 解析配置
         self.target_key_cols = config['target_key_cols']          # 列字母列表，如 ['A', 'B']
@@ -124,16 +126,45 @@ class ExcelMatcher:
             return False
 
     def _extract_target_keys(self):
-        """提取目标文件中所有行的组合主键"""
+        """提取目标文件中所有行的组合主键
+
+        性能优化（优化 3）：
+        先一次性检测 key 列是否与任何合并区间相交。
+        - 不相交：走 ws.cell(row, col).value 快速路径，跳过 O(M) 的 merged_cells 遍历
+        - 相交：走 get_cell_value 慢路径（原逻辑），保证合并单元格取值正确
+
+        两种路径在"key 列不在合并区间"时结果完全一致：
+        get_cell_value 的内部循环此时必不命中，返回值就是 cell.value。
+        """
         start_row = 2
         end_row = self.target_ws.max_row
         keys = []
-        for row in range(start_row, end_row + 1):
-            key = []
-            for col in self.target_key_indices:
-                val = self.target_wb.get_cell_value(row, col, sheet=self.target_ws)
-                key.append(str(val).strip() if val else '')
-            keys.append(tuple(key))
+
+        # 检测 key 列是否与任何合并区间相交（一次性开销，避免 R 次重复遍历）
+        key_cols_set = set(self.target_key_indices)
+        key_in_merge = False
+        for merged in self.target_ws.merged_cells.ranges:
+            if any(merged.min_col <= c <= merged.max_col for c in key_cols_set):
+                key_in_merge = True
+                break
+
+        ws = self.target_ws
+        if key_in_merge:
+            # 慢速路径：key 列可能被合并，需走 get_cell_value
+            for row in range(start_row, end_row + 1):
+                key = []
+                for col in self.target_key_indices:
+                    val = self.target_wb.get_cell_value(row, col, sheet=ws)
+                    key.append(str(val).strip() if val else '')
+                keys.append(tuple(key))
+        else:
+            # 快速路径：直接读 cell.value
+            for row in range(start_row, end_row + 1):
+                key = []
+                for col in self.target_key_indices:
+                    val = ws.cell(row, col).value
+                    key.append(str(val).strip() if val else '')
+                keys.append(tuple(key))
         return keys, start_row, end_row
 
     def _build_lookup_dict(self):
@@ -210,17 +241,27 @@ class ExcelMatcher:
             for idx in self.result_col_indices:
                 copy_merge_structure(self.target_ws, ref_col, self.target_ws, idx, start_row, self.target_ws.max_row)
 
-        # 设置右对齐
+        # 设置右对齐（优化 4：Alignment 对象提到循环外复用，openpyxl 按值存储样式索引，等价）
+        right_align = Alignment(horizontal='right')
         for idx in self.result_col_indices:
             for row in range(start_row, self.target_ws.max_row + 1):
                 cell = self.target_ws.cell(row, idx)
-                cell.alignment = Alignment(horizontal='right')
+                cell.alignment = right_align
 
-    def _generate_report(self, used_target_keys, lookup, start_row):
-        """生成校验报告 sheet，展示所有源值列的值"""
-        target_keys_full, _, _ = self._extract_target_keys()
+    def _generate_report(self, used_target_keys, lookup, start_row, target_keys_full=None):
+        """生成校验报告 sheet，展示所有源值列的值
+
+        性能优化：
+        - 优化 2：target_keys_full 可由调用方传入，避免重复调用 _extract_target_keys
+        - 优化 1：set(target_keys_used) 提到循环外，避免 O(S*R) 的重复哈希
+        - 优化 4：Alignment 对象提到循环外复用
+        """
+        if target_keys_full is None:
+            target_keys_full, _, _ = self._extract_target_keys()
         target_keys_used = used_target_keys
         source_keys_set = set(lookup.keys())
+        # 优化 1：提前构建 target_keys_used 的 set，避免在"仅源文件"循环里每次重建
+        target_keys_used_set = set(target_keys_used)
 
         # 准备列标题：行号、目标键、源匹配键、每个源值列的值、匹配状态、备注
         header_row = 1
@@ -271,8 +312,9 @@ class ExcelMatcher:
                 row_idx += 1
 
         # 仅源文件存在的记录
+        # 优化 1：使用提前构建好的 target_keys_used_set，避免 O(S*R) 的重复哈希
         for key, val_tuple in lookup.items():
-            if key not in set(target_keys_used):
+            if key not in target_keys_used_set:
                 row_data = ['-', '', "|".join(str(v) for v in key)]
                 for col_idx in range(len(self.source_value_cols)):
                     val = val_tuple[col_idx] if col_idx < len(val_tuple) else ''
@@ -283,11 +325,14 @@ class ExcelMatcher:
                     report_sheet.cell(row_idx, col_idx).value = val
                 row_idx += 1
 
-        # 设置对齐
+        # 设置对齐（优化 4：Alignment 对象提到循环外复用）
+        left_align = Alignment(horizontal='left')
+        right_align = Alignment(horizontal='right')
         for col in range(1, len(headers) + 1):
+            align = left_align if col == 1 else right_align
             for row in range(2, row_idx):
                 cell = report_sheet.cell(row, col)
-                cell.alignment = Alignment(horizontal='right' if col > 1 else 'left')
+                cell.alignment = align
 
     def match(self):
         if not self._validate_column_letters():
@@ -314,7 +359,11 @@ class ExcelMatcher:
         self._write_result_columns(used_target_keys, lookup, start_row)
 
         # 生成报告（多列版本）
-        self._generate_report(used_target_keys, lookup, start_row)
+        # 优化 2：把已算好的 target_keys 传进去，避免 _generate_report 重新提取
+        # 优化 5：generate_report=False 时跳过报告生成（大文件场景显著提速）
+        if self.generate_report:
+            self._generate_report(used_target_keys, lookup, start_row,
+                                  target_keys_full=target_keys)
 
         out_path = os.path.join(os.path.dirname(self.target_path), f"matched_{os.path.basename(self.target_path)}")
         self.target_wb.save(out_path)

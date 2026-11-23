@@ -172,3 +172,34 @@ class TestMatcherIntegration:
         assert response.status_code == 200
         content = response.data.decode('utf-8')
         assert 'source_value_cols' in content or 'config' in content
+
+    def test_match_with_generate_report_off(self, client, target_file, source_file):
+        """测试关闭校验报告开关：结果 xlsx 不应包含'校验报告' sheet"""
+        data = {
+            'target_file': (target_file, 'target.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'generate_report': 'off',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        xlsx = pd.ExcelFile(io.BytesIO(response.data))
+        assert '校验报告' not in xlsx.sheet_names
+
+    def test_match_with_generate_report_default_on(self, client, target_file, source_file):
+        """测试默认行为：不传 generate_report 时，应生成校验报告（向后兼容）"""
+        data = {
+            'target_file': (target_file, 'target.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        xlsx = pd.ExcelFile(io.BytesIO(response.data))
+        assert '校验报告' in xlsx.sheet_names
