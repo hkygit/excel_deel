@@ -845,6 +845,24 @@ def _parse_multi_cols(raw: str) -> list:
     return split_fields(raw)
 
 
+def _resolve_duplicate_action(form) -> str:
+    """解析目标键重复时的处理方式。
+
+    新参数 duplicate_action 优先：
+        - 'error'  : 检测到重复键时报错（默认）
+        - 'first'  : 只填充第一个匹配行，其余行保留原值
+        - 'all'    : 填充所有匹配行
+    兼容旧参数 allow_duplicate_keys='on' → 'first'（旧语义：只填第一个）
+    都未传时：'error'
+    """
+    action = (form.get('duplicate_action') or '').strip().lower()
+    if action in ('error', 'first', 'all'):
+        return action
+    if form.get('allow_duplicate_keys') == 'on':
+        return 'first'
+    return 'error'
+
+
 def _write_dataframe_to_worksheet(ws, df):
     """
     将 DataFrame 写入 worksheet（替代 pandas.to_excel，避免临时文件冲突）。
@@ -986,7 +1004,7 @@ def process():
     source_match_cols_raw = request.form.get('source_match_cols', '').strip()
     source_value_cols_raw = request.form.get('source_value_col', '').strip()
     result_cols_raw = request.form.get('result_col', '').strip()
-    allow_duplicate_keys = request.form.get('allow_duplicate_keys') == 'on'
+    duplicate_action = _resolve_duplicate_action(request.form)
 
     if not target_key_cols_raw or not source_match_cols_raw or not source_value_cols_raw or not result_cols_raw:
         raise ValidationError('请填写完整配置项')
@@ -1010,7 +1028,8 @@ def process():
         'source_match_cols': source_match_cols,
         'source_value_cols': source_value_cols,
         'result_cols': result_cols,
-        'allow_duplicate_keys': allow_duplicate_keys
+        'duplicate_action': duplicate_action,
+        'generate_report': request.form.get('generate_report', 'on') != 'off',
     }
 
     logger.info("[匹配填充] 开始执行 ExcelMatcher.match()")
@@ -1074,7 +1093,7 @@ def debug():
     source_match_cols_raw = request.form.get('source_match_cols', '').strip()
     source_value_cols_raw = request.form.get('source_value_col', '').strip()
     result_cols_raw = request.form.get('result_col', '').strip()
-    allow_duplicate_keys = request.form.get('allow_duplicate_keys') == 'on'
+    duplicate_action = _resolve_duplicate_action(request.form)
 
     if not target_key_cols_raw or not source_match_cols_raw or not source_value_cols_raw or not result_cols_raw:
         return render_template('error.html', error='请填写完整配置项'), 400
@@ -1095,7 +1114,7 @@ def debug():
         'source_match_cols': source_match_cols,
         'source_value_cols': source_value_cols,
         'result_cols': result_cols,
-        'allow_duplicate_keys': allow_duplicate_keys
+        'duplicate_action': duplicate_action,
     }
 
     matcher = ExcelMatcher(target_path, source_path, config, sheet_indices)
@@ -1956,38 +1975,5 @@ from .exceptions import *
 from .config import settings
 from .expression_engine import ExpressionEngine, get_expression_engine
 from .data_access_layer import DataAccessLayer, get_data_access_layer
-    ```
-
-- **core/column_resolver.py**
-  - language: `python`
-  - content:
-    ```python
-# core/column_resolver.py
-"""公共列解析：将用户输入的列名/列字母转换为DataFrame子集"""
-from typing import List, Dict
-import pandas as pd
-from core.csv_utils import split_fields
-from core.exceptions import ValidationError
-
-def resolve_columns(df: pd.DataFrame, col_str: str) -> pd.DataFrame:
-    if not col_str.strip():
-        return df
-    candidates = split_fields(col_str)
-    from core.csv_utils import build_column_mapping
-    col_map = build_column_mapping(df.columns.tolist())[0]
-    final = []
-    for cand in candidates:
-        if not cand:
-            continue
-        if cand.isalpha() and len(cand) <= 3:   # 列字母
-            upper = cand.upper()
-            if upper in col_map:
-                final.append(col_map[upper])
-                continue
-        if cand in df.columns:                   # 列名
-            final.append(cand)
-    if not final:
-        raise ValidationError("指定的列均不存在或无效")
-    return df[final]
     ```
 

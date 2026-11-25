@@ -1,3 +1,178 @@
+- **services/subtotal/engine.py**
+  - language: `python`
+  - content:
+    ```python
+# services/subtotal/engine.py
+import os
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Border, Side
+from openpyxl.utils import column_index_from_string, get_column_letter
+from core.csv_utils import split_fields
+from core.header_detection import SimpleExcelHeaderDetector
+from core.file_naming import generate_output_filename
+
+SUBTOTAL_FILL = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+SUBTOTAL_FONT = Font(bold=True)
+THIN_BORDER = Border(left=Side('thin'), right=Side('thin'), top=Side('thin'), bottom=Side('thin'))
+
+def _build_header_map(ws):
+    """根据工作表第一行构建列名 -> 列字母的映射"""
+    header_map = {}
+    for cell in ws[1]:
+        if cell.value is not None:
+            col_letter = get_column_letter(cell.column)
+            header_map[str(cell.value).strip()] = col_letter
+    return header_map
+
+def resolve_single_col(token, header_map):
+    """解析单个列标识（字母或列名），返回1-based列索引"""
+    try:
+        return column_index_from_string(token)
+    except (ValueError, KeyError):
+        if token in header_map:
+            return column_index_from_string(header_map[token])
+        raise ValueError(f"无效的列标识: {token}")
+
+def parse_cols_with_header(raw, header_map):
+    """解析列字符串（支持范围、列名），返回列索引列表"""
+    if not raw:
+        return []
+    items = split_fields(raw)
+    result = []
+    for item in items:
+        if '-' in item:
+            start_str, end_str = item.split('-', 1)
+            start_idx = resolve_single_col(start_str.strip(), header_map)
+            end_idx = resolve_single_col(end_str.strip(), header_map)
+            for i in range(start_idx, end_idx + 1):
+                result.append(i)
+        else:
+            result.append(resolve_single_col(item.strip(), header_map))
+    return sorted(list(set(result)))
+
+class SubtotalEngine:
+    def __init__(self, filepath, key_cols_str, calc_cols_str, agg_funcs,
+                 dimension_cols=None, sheets='1', original_filename='data.xlsx'):
+        self.filepath = filepath
+        self.original_filename = original_filename
+        self.key_cols_raw = key_cols_str
+        self.calc_cols_raw = calc_cols_str
+        self.dimension_cols_raw = dimension_cols or ''
+        self.agg_funcs = agg_funcs
+        self.sheets = sheets
+        self.detector = SimpleExcelHeaderDetector()
+        self.key_cols = []
+        self.calc_cols = []
+        self.dimension_cols = []
+
+    def _get_agg_func(self, col_letter):
+        return self.agg_funcs.get(col_letter, self.agg_funcs.get('default', 'sum'))
+
+    def process(self):
+        wb = openpyxl.load_workbook(self.filepath)
+        first_ws = wb.active
+        header_map = _build_header_map(first_ws)
+
+        self.key_cols = parse_cols_with_header(self.key_cols_raw, header_map)
+        self.calc_cols = parse_cols_with_header(self.calc_cols_raw, header_map)
+        if self.dimension_cols_raw:
+            self.dimension_cols = parse_cols_with_header(self.dimension_cols_raw, header_map)
+
+        header_result = self.detector.detect_from_workbook(wb)
+        data_start_excel_row = header_result.get_data_start_excel_row()
+
+        sheet_names = wb.sheetnames
+        if self.sheets == 'all':
+            target_sheets = sheet_names
+        else:
+            indices = [int(x.strip()) for x in self.sheets.split(',') if x.strip().isdigit()]
+            target_sheets = [sheet_names[i-1] for i in indices if 1 <= i <= len(sheet_names)]
+
+        for sheet_name in target_sheets:
+            ws = wb[sheet_name]
+            self._process_sheet(ws, data_start_excel_row)
+
+        out_name = generate_output_filename('subtotal', self.original_filename)
+        out_dir = os.path.dirname(self.filepath)
+        out_path = os.path.join(out_dir, out_name)
+        wb.save(out_path)
+        wb.close()
+        return out_path
+
+    def _process_sheet(self, ws, data_start_row):
+        max_col = ws.max_column
+        max_row = ws.max_row
+        if data_start_row > max_row:
+            return
+
+        groups = {}
+        for row_idx in range(data_start_row, max_row + 1):
+            key = tuple(ws.cell(row_idx, col).value for col in self.key_cols)
+            # ---- 修复：跳过主键全为空的行（避免生成无意义的小计行） ----
+            if all(v is None or str(v).strip() == '' for v in key):
+                continue
+            groups.setdefault(key, []).append(row_idx)
+
+        # 如果没有有效组，直接返回
+        if not groups:
+            return
+
+        sorted_groups = sorted(groups.items(), key=lambda x: max(x[1]), reverse=True)
+
+        for key, rows in sorted_groups:
+            last_row = max(rows)
+            ws.insert_rows(last_row + 1)
+            subtotal_row = last_row + 1
+
+            for col_idx in range(1, max_col + 1):
+                cell = ws.cell(subtotal_row, col_idx)
+                cell.fill = SUBTOTAL_FILL
+                cell.font = SUBTOTAL_FONT
+                cell.border = THIN_BORDER
+
+            for i, col in enumerate(self.key_cols):
+                ws.cell(subtotal_row, col).value = key[i]
+
+            for col in self.dimension_cols:
+                ws.cell(subtotal_row, col).value = '合计'
+
+            for col in self.calc_cols:
+                col_letter = get_column_letter(col)
+                func = self._get_agg_func(col_letter)
+                values = []
+                for r in rows:
+                    val = ws.cell(r, col).value
+                    try:
+                        val = float(val)
+                    except (TypeError, ValueError):
+                        val = 0
+                    values.append(val)
+
+                if func == 'sum':
+                    result = sum(values)
+                elif func == 'avg':
+                    result = sum(values) / len(values) if values else 0
+                elif func == 'min':
+                    result = min(values) if values else 0
+                elif func == 'max':
+                    result = max(values) if values else 0
+                elif func == 'count':
+                    result = len(values)
+                else:
+                    result = sum(values)
+                ws.cell(subtotal_row, col).value = result
+    ```
+
+- **services/team_report/__init__.py**
+  - language: `python`
+  - content:
+    ```python
+# services/team_report/__init__.py
+"""车队日报服务"""
+from .service import TeamReportService
+from .writer import TeamReportExcelWriter
+    ```
+
 - **services/team_report/service.py**
   - language: `python`
   - content:
@@ -1788,194 +1963,5 @@ label {
     {% block scripts %}{% endblock %}
 </body>
 </html>
-    ```
-
-- **templates/calculator/index.html**
-  - language: `html`
-  - content:
-    ```html
-{% extends "base.html" %}
-{% block title %}列计算 / 聚合回填{% endblock %}
-{% block content %}
-<h2>🧮 列计算 / 聚合回填</h2>
-<form action="{{ url_for('calc.process') }}" method="post" enctype="multipart/form-data">
-    <div class="form-section">
-        <div class="form-row">
-            <label>📁 上传 Excel 文件</label>
-            <input type="file" name="file" accept=".xlsx,.xls" required>
-        </div>
-        <div class="form-row">
-            <label>⚙️ 操作类型</label>
-            <select name="calc_type" id="calcType">
-                <option value="column">列计算</option>
-                <option value="aggregate">聚合回填</option>
-            </select>
-        </div>
-        <div class="form-row">
-            <label>表头所在行号（从1开始，默认1）</label>
-            <input type="number" name="header_row" value="1" min="1" style="max-width:100px;">
-            <div class="hint">如果你的 Excel 顶部有标题行，请填写实际列名所在的行号</div>
-        </div>
-    </div>
-    <div id="columnConfig" class="form-section">
-        <h3>📐 列计算设置</h3>
-        <div class="form-row">
-            <label>表达式 (如 A+B-C)</label>
-            <input type="text" name="expression" placeholder="例如 A+B">
-        </div>
-        <div class="form-row">
-            <label>结果列 (字母或新列名)</label>
-            <input type="text" name="result_col_column" placeholder="K 或 '差值'">
-        </div>
-        <div class="form-row">
-            <label>合并依据列 (可选，逗号分隔)</label>
-            <input type="text" name="merge_by_cols" placeholder="A,B">
-            <div class="hint">相同组的结果列只保留第一行，其余合并。</div>
-        </div>
-    </div>
-    <div id="aggregateConfig" class="form-section" style="display:none;">
-        <h3>📊 聚合回填设置</h3>
-        <div class="form-row">
-            <label>分组列 (逗号分隔，支持列名或列字母)</label>
-            <input type="text" name="group_cols" placeholder="A,B">
-        </div>
-        <div class="form-row">
-            <label>聚合列 (逗号分隔)</label>
-            <input type="text" name="agg_cols" placeholder="C,D">
-        </div>
-        <div class="form-row">
-            <label>聚合函数</label>
-            <select name="agg_func">
-                <option value="sum">求和</option>
-                <option value="mean">平均值</option>
-                <option value="max">最大值</option>
-                <option value="min">最小值</option>
-                <option value="count">计数</option>
-            </select>
-        </div>
-        <div class="form-row">
-            <label>结果列名</label>
-            <input type="text" name="result_col_aggregate" placeholder="K 或 '聚合结果'">
-        </div>
-    </div>
-    <button type="submit" class="btn btn-success">开始处理</button>
-</form>
-<script>
-    const typeSelect = document.getElementById('calcType');
-    const colCfg = document.getElementById('columnConfig');
-    const aggCfg = document.getElementById('aggregateConfig');
-    function toggle() {
-        if (typeSelect.value === 'column') {
-            colCfg.style.display = 'block';
-            aggCfg.style.display = 'none';
-        } else {
-            colCfg.style.display = 'none';
-            aggCfg.style.display = 'block';
-        }
-    }
-    typeSelect.addEventListener('change', toggle);
-    toggle();
-</script>
-{% endblock %}
-    ```
-
-- **templates/checker/index.html**
-  - language: `html`
-  - content:
-    ```html
-{% extends "base.html" %}
-{% block title %}文件校验{% endblock %}
-{% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/checker.css') }}">
-{% endblock %}
-{% block content %}
-<h2>✅ 文件校验</h2>
-<p>上传标准文件群和比较文件群，系统将根据您指定的主键和对比列进行比较，并生成差异报告。</p>
-
-<form id="checkerForm" enctype="multipart/form-data">
-    <div class="form-section">
-        <h3>📂 文件上传</h3>
-        <div class="form-row">
-            <label>标准文件群（可多选）</label>
-            <input type="file" id="filesA" name="files_a" accept=".xlsx,.xls,.csv" multiple required>
-        </div>
-        <div class="form-row">
-            <label>比较文件群（可多选）</label>
-            <input type="file" id="filesB" name="files_b" accept=".xlsx,.xls,.csv" multiple required>
-        </div>
-    </div>
-
-    <div class="form-section">
-        <h3>🔑 主键设置</h3>
-        <div class="form-row">
-            <label>标准群主键列（逗号或空格分隔）</label>
-            <input type="text" id="keyMapA" placeholder="例如 ID,日期">
-        </div>
-        <div class="form-row">
-            <label>比较群主键列（逗号或空格分隔，默认与标准相同）</label>
-            <input type="text" id="keyMapB" placeholder="留空则与标准群主键相同">
-        </div>
-        <div class="form-row">
-            <label>主键重复处理</label>
-            <select id="duplicateAction">
-                <option value="error" selected>报错</option>
-                <option value="keep_first">保留第一条</option>
-            </select>
-        </div>
-    </div>
-
-    <div class="form-section">
-        <h3>📊 对比列</h3>
-        <div class="parser-container" style="display: flex; gap: 20px;">
-            <div class="parser-box" style="flex: 1;">
-                <label>标准群对比列（每行一个或用逗号/空格分隔）</label>
-                <textarea id="compareStandardText" rows="5" placeholder="例如：医疗类别&#10;入院日期&#10;出院日期&#10;医疗费总额&#10;结算时间&#10;定点医药机构名称"></textarea>
-            </div>
-            <div class="parser-box" style="flex: 1;">
-                <label>比较群对比列（留空则与标准相同）</label>
-                <textarea id="compareCompareText" rows="5" placeholder="例如：医疗类别&#10;入院日期&#10;出院日期&#10;医疗费总额&#10;结算时间&#10;定点医疗机构名称"></textarea>
-            </div>
-        </div>
-        <div class="hint">按顺序一一对应，支持多列；比较群留空则默认与标准群列名相同。</div>
-    </div>
-
-    <div class="form-section">
-        <h3>🔍 标准群筛选（可选）</h3>
-        <div id="filtersContainer"></div>
-        <button type="button" class="btn btn-secondary" onclick="addFilter()">+ 添加筛选条件</button>
-        <div class="hint">支持多值OR：在“值”中用英文逗号分隔多个值</div>
-    </div>
-
-    <div style="text-align:center; margin: 30px 0;">
-        <button type="button" class="btn" id="btnPrecheck">🔎 预检</button>
-        <button type="button" class="btn btn-success" id="btnStart" disabled>▶ 开始校验</button>
-    </div>
-</form>
-
-<div id="statusArea" class="status-area" style="display:none;">
-    <h3>任务状态</h3>
-    <div class="progress"><div id="progressBar" class="progress-bar" style="width:0%"></div></div>
-    <p><strong>状态：</strong> <span id="taskStatus">等待中</span></p>
-    <p id="progressMessage" style="color:#666;"></p>
-    <div id="precheckResult" class="precheck-result"></div>
-    <div id="downloadLink" style="margin-top:15px;"></div>
-</div>
-
-<template id="filterRowTemplate">
-    <div class="filter-row">
-        <input type="text" name="filter_field" placeholder="字段名" class="filter-field">
-        <select name="filter_op" class="filter-op">
-            <option value="=">=</option><option value="!=">!=</option><option value=">">></option>
-            <option value="<"><</option><option value=">=">>=</option><option value="<="><=</option>
-            <option value="contains">包含</option><option value="not_contains">不包含</option>
-        </select>
-        <input type="text" name="filter_value" placeholder="值（多值用英文逗号）" class="filter-value">
-        <button type="button" class="btn btn-danger" onclick="this.parentElement.remove()">删除</button>
-    </div>
-</template>
-{% endblock %}
-{% block scripts %}
-<script src="{{ url_for('static', filename='js/checker.js') }}"></script>
-{% endblock %}
     ```
 

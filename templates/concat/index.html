@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}分组拼接{% endblock %}
+{% block content %}
+<h2>🔗 分组拼接</h2>
+<p>按某一列分组，把其他列的多个值合并到同一单元格。适用于「一证多病」「一单多商品」等明细汇总场景。</p>
+
+<form id="concatForm" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📁 上传 Excel 文件</label>
+            <input type="file" name="file" accept=".xlsx,.xls,.xlsm" required>
+            <div class="hint">≤ 10MB；只处理第一个 sheet</div>
+        </div>
+        <div class="form-row">
+            <label>表头所在行号（可选，留空自动检测）</label>
+            <input type="number" name="header_row" min="1" placeholder="例如 1" style="max-width:120px;">
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>🔑 分组列</h3>
+        <div class="form-row">
+            <label>分组列（列名或列字母，如 A 或 身份证号）</label>
+            <input type="text" name="group_col" placeholder="例如 A 或 身份证号" required>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>📋 拼接列</h3>
+        <div class="form-row">
+            <label>拼接列（多个用逗号或空格分隔，支持列名或列字母）</label>
+            <input type="text" name="concat_cols" placeholder="例如 疾病名称,疾病代码 或 B,C" required>
+            <div class="hint">每列独立排序、独立去重、独立拼接</div>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>⚙️ 处理选项</h3>
+        <div class="form-row">
+            <label>分隔符</label>
+            <input type="text" name="separator" value="," placeholder="默认英文逗号，可输入 ， 或 \t 或 \n">
+            <div class="hint">支持：英文逗号、中文逗号、制表符 \t、换行 \n、多字符、空串</div>
+        </div>
+        <div class="form-row">
+            <label>排序方向（仅拼接列）</label>
+            <select name="sort_ascending">
+                <option value="true" selected>升序</option>
+                <option value="false">降序</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>去重保留</label>
+            <select name="dup_keep">
+                <option value="first" selected>保留首次</option>
+                <option value="last">保留末次</option>
+            </select>
+        </div>
+    </div>
+
+    <button type="submit" class="btn btn-success" id="submitBtn">开始处理</button>
+</form>
+
+<div id="statusArea" class="status-area" style="display:none;">
+    <p id="statusMessage"></p>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/concat.js') }}"></script>
+{% endblock %}

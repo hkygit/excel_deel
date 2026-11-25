@@ -55,6 +55,7 @@ from blueprints.convert import convert_bp
 from blueprints.team_report import team_report_bp
 from blueprints.transposer import transposer_bp
 from blueprints.subtotal import subtotal_bp
+from blueprints.concat import concat_bp
 
 def clean_old_files(directory, age_hours):
     now = time.time()
@@ -108,6 +109,7 @@ def create_app():
     app.register_blueprint(team_report_bp, url_prefix='/team-report')
     app.register_blueprint(transposer_bp, url_prefix='/transposer')
     app.register_blueprint(subtotal_bp, url_prefix='/subtotal')
+    app.register_blueprint(concat_bp, url_prefix='/concat')
 
     init_logging(app)
 

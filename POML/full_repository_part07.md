@@ -1,3 +1,345 @@
+- **tests/test_core_task.py**
+  - language: `python`
+  - content:
+    ```python
+# tests/test_core_task.py
+"""TaskStorage / TaskManager 测试。
+
+覆盖：
+- 基础 CRUD（save / load / update / delete）
+- 未知字段的 extra 往返与合并
+- 任务日志隔离
+- WAL 模式已启用
+- 崩溃恢复（recover_orphan_tasks）
+- 多线程并发更新不丢数据
+- 旧 JSON 文件自动迁移
+- TaskManager 状态机
+"""
+import json
+import os
+import sqlite3
+import threading
+
+import pytest
+
+from core.task.storage import TaskStorage
+from core.task.manager import TaskManager
+from core.task.state import TaskStatus
+from core.task.base import Task
+
+
+class DummyTask(Task):
+    def __init__(self, should_fail=False, result_data=None):
+        self.should_fail = should_fail
+        self.result_data = result_data or {"output": "success"}
+
+    def execute(self):
+        if self.should_fail:
+            raise ValueError("模拟任务失败")
+        return self.result_data
+
+
+# ============================================================================
+# TaskStorage
+# ============================================================================
+class TestTaskStorage:
+    @pytest.fixture
+    def storage(self, tmp_path):
+        status_dir = tmp_path / "status"
+        output_dir = tmp_path / "output"
+        return TaskStorage(str(status_dir), str(output_dir))
+
+    # ---------- 基础 CRUD ----------
+    def test_save_and_load(self, storage):
+        task_id = "test-123"
+        data = {"status": "pending", "value": 42}
+        storage.save(task_id, data)
+        loaded = storage.load(task_id)
+        assert loaded["value"] == 42
+        assert loaded["status"] == "pending"
+        assert loaded["task_id"] == task_id
+
+    def test_update(self, storage):
+        task_id = "test-123"
+        storage.save(task_id, {"status": "pending"})
+        storage.update(task_id, status="completed", result="ok")
+        loaded = storage.load(task_id)
+        assert loaded["status"] == "completed"
+        assert loaded["result"] == "ok"
+
+    def test_delete(self, storage):
+        task_id = "delete-me"
+        storage.save(task_id, {})
+        assert storage.load(task_id) is not None
+        storage.delete(task_id)
+        assert storage.load(task_id) is None
+
+    def test_update_nonexistent_raises(self, storage):
+        with pytest.raises(ValueError, match="not found"):
+            storage.update("does-not-exist", status="completed")
+
+    # ---------- extra 字段 ----------
+    def test_extra_fields_roundtrip(self, storage):
+        task_id = "extra-test"
+        storage.save(
+            task_id,
+            {"status": "pending", "custom_a": 1, "custom_b": "x"},
+        )
+        loaded = storage.load(task_id)
+        assert loaded["custom_a"] == 1
+        assert loaded["custom_b"] == "x"
+
+    def test_extra_field_merges_on_update(self, storage):
+        task_id = "merge-test"
+        storage.save(task_id, {"status": "pending", "custom_a": 1})
+        storage.update(task_id, custom_b=2)
+        loaded = storage.load(task_id)
+        assert loaded["custom_a"] == 1
+        assert loaded["custom_b"] == 2
+
+    def test_params_dict_roundtrip(self, storage):
+        """params 字典应通过 JSON 往返无损。"""
+        task_id = "params-test"
+        params = {"file": "x.csv", "options": {"sep": ",", "enc": "utf-8"}}
+        storage.save(task_id, {"status": "pending", "params": params})
+        loaded = storage.load(task_id)
+        assert loaded["params"] == params
+
+    # ---------- 日志 ----------
+    def test_append_and_get_log(self, storage):
+        task_id = "log-test"
+        storage.append_log(task_id, "first line")
+        storage.append_log(task_id, "second line")
+        log = storage.get_log(task_id)
+        assert "first line" in log
+        assert "second line" in log
+        # 顺序应保持
+        assert log.index("first line") < log.index("second line")
+
+    def test_logs_isolated_by_task(self, storage):
+        storage.append_log("task-1", "hello 1")
+        storage.append_log("task-2", "hello 2")
+        assert "hello 1" in storage.get_log("task-1")
+        assert "hello 2" not in storage.get_log("task-1")
+
+    def test_get_log_limit(self, storage):
+        for i in range(10):
+            storage.append_log("many", f"line-{i}")
+        log = storage.get_log("many", max_lines=3)
+        # 应该只保留最后 3 行
+        assert "line-7" in log
+        assert "line-8" in log
+        assert "line-9" in log
+        assert "line-0" not in log
+
+    # ---------- SQLite 特性 ----------
+    def test_wal_mode_enabled(self, storage):
+        conn = sqlite3.connect(storage.db_path)
+        try:
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            assert mode.lower() == "wal"
+        finally:
+            conn.close()
+
+    def test_db_file_created(self, storage):
+        assert os.path.exists(storage.db_path)
+        assert storage.db_path.endswith("tasks.db")
+
+    # ---------- 崩溃恢复 ----------
+    def test_recover_orphan_tasks(self, storage):
+        storage.save("orphan-1", {"status": "running"})
+        storage.save("orphan-2", {"status": "pending"})
+        storage.save("done-1", {"status": "completed"})
+        storage.save("failed-1", {"status": "failed"})
+
+        count = storage.recover_orphan_tasks()
+        assert count == 2
+
+        assert storage.load("orphan-1")["status"] == "failed"
+        assert storage.load("orphan-2")["status"] == "failed"
+        assert storage.load("done-1")["status"] == "completed"
+        assert storage.load("failed-1")["status"] == "failed"
+        # 错误信息应该保留提示
+        assert "服务重启" in storage.load("orphan-1")["error"]
+
+    def test_recover_orphan_tasks_empty(self, storage):
+        """没有 pending/running 时返回 0。"""
+        storage.save("x", {"status": "completed"})
+        assert storage.recover_orphan_tasks() == 0
+
+    # ---------- 并发 ----------
+    def test_concurrent_updates_do_not_lose_data(self, tmp_path):
+        """多线程同时更新同一 task 的不同字段，字段不应丢失。"""
+        storage = TaskStorage(
+            str(tmp_path / "s"), str(tmp_path / "o")
+        )
+        storage.save("conc", {"status": "running"})
+
+        def worker(i):
+            storage.update("conc", **{f"field_{i}": i})
+
+        threads = [
+            threading.Thread(target=worker, args=(i,)) for i in range(20)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        loaded = storage.load("conc")
+        for i in range(20):
+            assert loaded.get(f"field_{i}") == i, f"field_{i} lost"
+
+    # ---------- 旧 JSON 迁移 ----------
+    def test_json_migration(self, tmp_path):
+        """旧的 .json 任务文件应被迁移到 SQLite。"""
+        status_dir = tmp_path / "status"
+        status_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        legacy = {
+            "task_id": "legacy-1",
+            "status": "completed",
+            "created_at": "2026-01-01T00:00:00",
+            "result_path": "/tmp/x.xlsx",
+        }
+        (status_dir / "legacy-1.json").write_text(
+            json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
+        )
+        (status_dir / "legacy-1.log").write_text(
+            "[2026-01-01 00:00:01] hello\n"
+            "[2026-01-01 00:00:02] world\n",
+            encoding="utf-8",
+        )
+
+        # 初始化时自动迁移
+        storage = TaskStorage(str(status_dir), str(output_dir))
+
+        loaded = storage.load("legacy-1")
+        assert loaded is not None
+        assert loaded["status"] == "completed"
+        assert loaded["result_path"] == "/tmp/x.xlsx"
+
+        log = storage.get_log("legacy-1")
+        assert "hello" in log
+        assert "world" in log
+
+        # 旧文件应被移动到 .migrated/
+        migrated = status_dir / ".migrated"
+        assert migrated.is_dir()
+        assert (migrated / "legacy-1.json").exists()
+
+    def test_json_migration_skips_corrupt(self, tmp_path):
+        """损坏的 JSON 文件不应阻塞其他文件的迁移。"""
+        status_dir = tmp_path / "status"
+        status_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        (status_dir / "corrupt.json").write_text(
+            "{not valid json", encoding="utf-8"
+        )
+        (status_dir / "good.json").write_text(
+            json.dumps({"task_id": "good", "status": "completed"}),
+            encoding="utf-8",
+        )
+
+        storage = TaskStorage(str(status_dir), str(output_dir))
+        assert storage.load("good") is not None
+        # 损坏的文件保持原样（不能被识别为有效任务）
+        assert storage.load("corrupt") is None
+
+
+# ============================================================================
+# TaskManager（状态机）
+# ============================================================================
+class TestTaskManager:
+    @pytest.fixture
+    def storage(self, tmp_path):
+        status_dir = tmp_path / "status"
+        output_dir = tmp_path / "output"
+        return TaskStorage(str(status_dir), str(output_dir))
+
+    @pytest.fixture
+    def manager(self, storage):
+        return TaskManager(storage)
+
+    def test_create_task(self, manager):
+        params = {"file": "test.csv"}
+        task_id = manager.create_task(params, original_filename="test")
+        assert task_id is not None
+        status = manager.storage.load(task_id)
+        assert status["status"] == TaskStatus.PENDING
+        assert status["params"] == params
+
+    def test_submit_and_complete(self, manager):
+        task_id = manager.create_task({})
+        manager.storage.update(task_id, status=TaskStatus.RUNNING)
+        manager.complete_task(
+            task_id, result_path="/out.xlsx", total_input_rows=100
+        )
+        status = manager.storage.load(task_id)
+        assert status["status"] == TaskStatus.COMPLETED
+        assert status["result_path"] == "/out.xlsx"
+
+    def test_fail_task(self, manager):
+        task_id = manager.create_task({})
+        manager.fail_task(task_id, error="Something wrong")
+        status = manager.storage.load(task_id)
+        assert status["status"] == TaskStatus.FAILED
+        assert status["error"] == "Something wrong"
+
+    def test_cancel_task(self, manager):
+        task_id = manager.create_task({})
+        manager.cancel_task(task_id)
+        status = manager.storage.load(task_id)
+        assert status["status"] == TaskStatus.CANCELLED
+
+    def test_manager_with_recover(self, manager, storage):
+        """模拟服务重启后，遗留的 running 任务应被恢复。"""
+        task_id = manager.create_task({})
+        manager.storage.update(task_id, status=TaskStatus.RUNNING)
+        # 模拟重启
+        count = storage.recover_orphan_tasks()
+        assert count == 1
+        status = manager.storage.load(task_id)
+        assert status["status"] == TaskStatus.FAILED
+    ```
+
+- **tests/test_data_access_layer.py**
+  - language: `python`
+  - content:
+    ```python
+import pytest
+import pandas as pd
+from core.data_access_layer import DataAccessLayer
+
+class TestDataAccessLayer:
+    def test_auto_clean_strings(self):
+        dal = DataAccessLayer()
+        df = pd.DataFrame({'A': [' 10 ', '20', ' 30 ']})
+        cleaned = dal._auto_clean_dataframe(df)
+        # 数值转换后应为数字，但测试允许字符串或数字（向后兼容）
+        assert cleaned['A'].tolist() == [10.0, 20.0, 30.0] or cleaned['A'].tolist() == ['10', '20', '30']
+
+    def test_dtype_hints(self):
+        dal = DataAccessLayer()
+        df = pd.DataFrame({'amount': ['100', '200', 'invalid']})
+        cleaned = dal._auto_clean_dataframe(df, dtype_hints={'amount': float})
+        # dtype_hints 会强制转换，无效值变为 NaN
+        assert cleaned['amount'].isna().sum() == 1
+
+    def test_empty_string_handling(self):
+        dal = DataAccessLayer()
+        df = pd.DataFrame({'A': ['', '   ', '10']})
+        cleaned = dal._auto_clean_dataframe(df)
+        # 空字符串变为 NaN，'10' 转为数字或保持字符串
+        assert pd.isna(cleaned['A'].iloc[0])
+        assert pd.isna(cleaned['A'].iloc[1])
+        assert cleaned['A'].iloc[2] == 10.0 or cleaned['A'].iloc[2] == '10'
+    ```
+
 - **tests/test_di_container.py**
   - language: `python`
   - content:
@@ -1227,6 +1569,134 @@ class TestMatcherIntegration:
         assert response.status_code == 200
         content = response.data.decode('utf-8')
         assert 'source_value_cols' in content or 'config' in content
+
+    def test_match_with_generate_report_off(self, client, target_file, source_file):
+        """测试关闭校验报告开关：结果 xlsx 不应包含'校验报告' sheet"""
+        data = {
+            'target_file': (target_file, 'target.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'generate_report': 'off',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        xlsx = pd.ExcelFile(io.BytesIO(response.data))
+        assert '校验报告' not in xlsx.sheet_names
+
+    def test_match_with_generate_report_default_on(self, client, target_file, source_file):
+        """测试默认行为：不传 generate_report 时，应生成校验报告（向后兼容）"""
+        data = {
+            'target_file': (target_file, 'target.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        xlsx = pd.ExcelFile(io.BytesIO(response.data))
+        assert '校验报告' in xlsx.sheet_names
+
+    @pytest.fixture
+    def target_file_duplicate_unmatched(self):
+        """ID=99 出现两次但源里没有 99；ID=1 匹配。
+        用于验证 all 模式下未匹配重复行填 0（与 first 模式第 1 行一致）"""
+        wb = Workbook()
+        ws = wb.active
+        ws['A1'] = 'ID'
+        ws['B1'] = 'Value1'
+        ws['A2'] = 99
+        ws['B2'] = 'orig1'
+        ws['A3'] = 99
+        ws['B3'] = 'orig2'
+        ws['A4'] = 1
+        ws['B4'] = ''
+        f = io.BytesIO()
+        wb.save(f)
+        f.seek(0)
+        return f
+
+    def test_duplicate_action_first_explicit(self, client, target_file_duplicate, source_file):
+        """显式 duplicate_action='first'，行为应与 allow_duplicate_keys='on' 一致"""
+        data = {
+            'target_file': (target_file_duplicate, 'target_dup.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'first',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        result_df = pd.read_excel(io.BytesIO(response.data))
+        # 第 1 行（ID=1）填 100
+        assert result_df.loc[0, 'Value1'] == 100
+        # 第 2 行（ID=1，重复）保留原值（空）
+        assert result_df.loc[1, 'Value1'] == '' or pd.isna(result_df.loc[1, 'Value1'])
+        # 第 3 行（ID=2）填 200
+        assert result_df.loc[2, 'Value1'] == 200
+
+    def test_duplicate_action_all(self, client, target_file_duplicate, source_file):
+        """duplicate_action='all'，所有匹配行都填充相同值"""
+        data = {
+            'target_file': (target_file_duplicate, 'target_dup.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'all',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        result_df = pd.read_excel(io.BytesIO(response.data))
+        # 两行 ID=1 都被填充 100
+        assert result_df.loc[0, 'Value1'] == 100
+        assert result_df.loc[1, 'Value1'] == 100
+        # 第 3 行（ID=2）填 200
+        assert result_df.loc[2, 'Value1'] == 200
+
+    def test_duplicate_action_all_with_unmatched(self, client, target_file_duplicate_unmatched, source_file):
+        """duplicate_action='all' 且重复 key 在源中无匹配：填 0（与 first 模式第 1 行一致）"""
+        data = {
+            'target_file': (target_file_duplicate_unmatched, 'target_dup_unmatched.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'all',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 200
+        result_df = pd.read_excel(io.BytesIO(response.data))
+        # ID=99 两行均未匹配，都填 0（覆盖原值 orig1/orig2）
+        assert result_df.loc[0, 'Value1'] == 0
+        assert result_df.loc[1, 'Value1'] == 0
+        # 第 3 行（ID=1）填 100
+        assert result_df.loc[2, 'Value1'] == 100
+
+    def test_duplicate_action_invalid_value(self, client, target_file_duplicate, source_file):
+        """非法 duplicate_action 值降级为 'error'，检测到重复键时报错"""
+        data = {
+            'target_file': (target_file_duplicate, 'target_dup.xlsx'),
+            'source_file': (source_file, 'source.xlsx'),
+            'target_key_cols': 'A',
+            'source_match_cols': 'A',
+            'source_value_col': 'B',
+            'result_col': 'B',
+            'duplicate_action': 'xxx',
+        }
+        response = client.post('/match/process', data=data, content_type='multipart/form-data')
+        assert response.status_code == 400
+        resp_json = response.get_json()
+        assert not resp_json['success']
+        assert '重复' in resp_json['error']
     ```
 
 - **tests/test_integration_splitter.py**
@@ -1486,447 +1956,5 @@ class TestTeamReportIntegration:
             time.sleep(0.3)
         dl = client.get(f"/team-report/download/{tid}")
         assert dl.status_code == 200
-    ```
-
-- **tests/test_no_legacy_compat.py**
-  - language: `python`
-  - content:
-    ```python
-# tests/test_no_legacy_compat.py
-"""回归测试：确认历史兼容层已被清除，且公开 API 未受影响。
-
-设计意图：
-- 防止未来有人"顺手"把删除的类/方法加回来
-- 同时保证删除后真正在用的公开 API 依然可用
-"""
-import ast
-import inspect
-
-import pytest
-
-
-class TestRemovedLegacyLayers:
-    # ---------- 兼容类 ----------
-    def test_aggregate_calculator_removed(self):
-        """AggregateCalculator 兼容包装应已删除。"""
-        import services.excel.aggregator as agg_mod
-        assert not hasattr(agg_mod, 'AggregateCalculator'), (
-            "AggregateCalculator 是历史兼容层，不应存在于 services.excel.aggregator"
-        )
-
-    # ---------- 兼容静态方法 ----------
-    def test_excel_file_legacy_static_methods_removed(self):
-        """ExcelFile 的 3 个兼容静态方法应已删除。"""
-        from core.excel_utils import ExcelFile
-        legacy_methods = [
-            'copy_cell_style',
-            'copy_merge_structure_static',
-            'get_cell_value_static',
-        ]
-        for name in legacy_methods:
-            assert not hasattr(ExcelFile, name), (
-                f"ExcelFile.{name} 是历史兼容层，应已被删除"
-            )
-
-    # ---------- blueprints/__init__ ----------
-    def test_blueprints_init_does_not_import_blueprints(self):
-        """blueprints/__init__.py 不应包含任何 import 语句。
-
-        不能用 hasattr(blueprints, 'xxx') 检查：
-            Python 包的机制决定了任何 ``import blueprints.calculator``
-            之后，该子模块会自动成为父包的属性。运行 pytest 时
-            conftest 会加载 app.py，而 app.py 又 import 了
-            blueprints.* 子模块，所以 hasattr 必然为 True——与
-            __init__.py 是否主动 import 无关。
-
-        改为通过 AST 检查源码里是否存在 Import / ImportFrom 节点，
-        这才是真正能反映"__init__.py 是否主动 import"的判据。
-        """
-        import blueprints as bp_module
-
-        src = inspect.getsource(bp_module)
-        tree = ast.parse(src)
-        import_nodes = [
-            node for node in ast.walk(tree)
-            if isinstance(node, (ast.Import, ast.ImportFrom))
-        ]
-        assert import_nodes == [], (
-            f"blueprints/__init__.py 不应包含 import 语句，"
-            f"但发现了 {len(import_nodes)} 个：{src!r}"
-        )
-
-    # ---------- DI provider ----------
-    def test_di_container_no_placeholder_providers(self):
-        """DI Container 不应保留无用的占位 provider。"""
-        from core.di import Container
-        legacy_providers = ['excel_service', 'column_calculator']
-        for name in legacy_providers:
-            assert not hasattr(Container, name), (
-                f"Container.{name} 是占位 provider，应已被删除"
-            )
-
-
-class TestPublicApiStillAvailable:
-    """删除兼容层后，真正被使用的 API 必须保持可用。"""
-
-    # ---------- core/excel_utils.py ----------
-    def test_excel_file_public_methods(self):
-        from core.excel_utils import ExcelFile
-        for name in [
-            'load', 'close', 'save', 'active_sheet', 'get_sheet',
-            'get_headers', 'get_cell_value', 'copy_merge_structure',
-            'read_dataframe', 'write_dataframe',
-        ]:
-            assert hasattr(ExcelFile, name), f"ExcelFile.{name} 不应被删除"
-
-    def test_excel_utils_module_functions(self):
-        from core.excel_utils import (
-            col_letter_to_index, col_index_to_letter,
-            validate_column_letters, copy_merge_structure,
-        )
-        assert callable(col_letter_to_index)
-        assert callable(col_index_to_letter)
-        assert callable(validate_column_letters)
-        assert callable(copy_merge_structure)
-
-    def test_copy_merge_structure_signature(self):
-        """模块级 copy_merge_structure 的签名应保持 6 参数。"""
-        from core.excel_utils import copy_merge_structure
-        sig = inspect.signature(copy_merge_structure)
-        params = list(sig.parameters.keys())
-        assert params == [
-            'src_ws', 'src_col', 'dst_ws', 'dst_col', 'start_row', 'end_row'
-        ]
-
-    # ---------- services/excel/aggregator.py ----------
-    def test_aggregator_public_methods(self):
-        from services.excel.aggregator import Aggregator
-        for name in ['group_aggregate', 'aggregate_by_keys', 'simple_aggregate']:
-            assert hasattr(Aggregator, name), f"Aggregator.{name} 不应被删除"
-
-    # ---------- DI Container 公开 provider ----------
-    def test_di_container_core_providers(self):
-        from core.di import Container
-        for name in [
-            'config', 'task_storage', 'task_manager',
-            'file_service', 'compute_engine',
-            'team_report_service', 'checker_service', 'convert_service',
-            'field_parser',
-            'splitter_config', 'checker_config', 'field_parser_config',
-            'team_report_config', 'convert_config',
-        ]:
-            assert hasattr(Container, name), f"Container.{name} 不应被删除"
-
-
-class TestFunctionalityUnchanged:
-    """删除兼容层不应影响功能。"""
-
-    def test_aggregator_still_works(self):
-        import pandas as pd
-        from services.excel.aggregator import Aggregator
-        df = pd.DataFrame({'G': ['X', 'X', 'Y'], 'V': [1, 2, 3]})
-        result = Aggregator.simple_aggregate(df, ['G'], ['V'], 'sum')
-        assert len(result) == 2
-        assert result.loc[result['G'] == 'X', 'V'].iloc[0] == 3
-
-    def test_excel_file_roundtrip(self, tmp_path):
-        import pandas as pd
-        from core.excel_utils import ExcelFile
-        df = pd.DataFrame({'A': [1, 2], 'B': [3, 4]})
-        src = tmp_path / 'in.xlsx'
-        dst = tmp_path / 'out.xlsx'
-        df.to_excel(src, index=False)
-
-        with ExcelFile(src) as ef:
-            headers = ef.get_headers()
-            assert headers == ['A', 'B']
-            v = ef.get_cell_value(2, 'A')
-            assert v == 1
-            ef.save(dst)
-
-        assert dst.exists()
-        roundtrip = pd.read_excel(dst)
-        pd.testing.assert_frame_equal(roundtrip, df)
-    ```
-
-- **tests/test_remove_result_column_expr.py**
-  - language: `python`
-  - content:
-    ```python
-# tests/test_remove_result_column_expr.py
-"""
-针对 ColumnCalculatorProcessor._remove_result_column_from_expr 的回归测试。
-
-核心目标：
-    验证"用 token 匹配替换子串 replace"这一修复，确保：
-    - 恰好等于结果列的独立标识符被移除
-    - 只是包含结果列字母的标识符（如 'AA', 'AB'）不被破坏
-    - 移除时连带清理邻近的二元运算符，不产生语法上非法的表达式
-"""
-import pytest
-
-from services.excel.calculator_processor import ColumnCalculatorProcessor
-from services.excel.compute_engine import ComputeEngine
-
-
-def _make_processor(expression: str) -> ColumnCalculatorProcessor:
-    """构造一个仅用于测试 _remove_result_column_from_expr 的处理器实例。"""
-    return ColumnCalculatorProcessor(
-        filepath="dummy.xlsx",      # 不用于本测试
-        header_row=1,
-        expression=expression,
-        result_col_input="Z",        # 不用于本测试
-        merge_by_cols_str="",
-        compute_engine=ComputeEngine(),
-    )
-
-
-class TestRemoveResultColumnFromExpr:
-    # ---------- 快速路径：无匹配 ----------
-    def test_no_match_returns_original(self):
-        p = _make_processor("A+B")
-        assert p._remove_result_column_from_expr("D") == "A+B"
-
-    def test_empty_expression(self):
-        p = _make_processor("")
-        assert p._remove_result_column_from_expr("A") == ""
-
-    def test_empty_result_col(self):
-        p = _make_processor("A+B")
-        assert p._remove_result_column_from_expr("") == "A+B"
-
-    # ---------- 关键回归：不得破坏子串标识符 ----------
-    def test_aa_identifier_not_corrupted_by_removing_a(self):
-        """'AA+B' 移除 'A'，'AA' 必须完整保留。"""
-        p = _make_processor("AA+B")
-        assert p._remove_result_column_from_expr("A") == "AA+B"
-
-    def test_ab_identifier_not_corrupted_by_removing_a(self):
-        """'AB+C' 移除 'A'，'AB' 必须完整保留。"""
-        p = _make_processor("AB+C")
-        assert p._remove_result_column_from_expr("A") == "AB+C"
-
-    def test_ab_identifier_not_corrupted_by_removing_b(self):
-        """'AB+C' 移除 'B'，'AB' 必须完整保留。"""
-        p = _make_processor("AB+C")
-        assert p._remove_result_column_from_expr("B") == "AB+C"
-
-    def test_multi_letter_identifiers_untouched(self):
-        """'AB+AC' 里没有任何 token 恰好等于 'A'。"""
-        p = _make_processor("AB+AC")
-        assert p._remove_result_column_from_expr("A") == "AB+AC"
-
-    # ---------- 标准移除：独立标识符 ----------
-    def test_removes_standalone_at_start(self):
-        p = _make_processor("A+B")
-        assert p._remove_result_column_from_expr("A") == "B"
-
-    def test_removes_standalone_at_end(self):
-        p = _make_processor("A+B")
-        assert p._remove_result_column_from_expr("B") == "A"
-
-    def test_removes_standalone_in_middle(self):
-        p = _make_processor("A+B-C")
-        assert p._remove_result_column_from_expr("B") == "A-C"
-
-    def test_removes_in_longer_chain(self):
-        p = _make_processor("A+B+C+D")
-        assert p._remove_result_column_from_expr("C") == "A+B+D"
-
-    # ---------- 括号与一元运算符 ----------
-    def test_removes_with_parens(self):
-        p = _make_processor("(A+B)*C")
-        assert p._remove_result_column_from_expr("B") == "(A)*C"
-
-    def test_removes_inside_nested_parens(self):
-        p = _make_processor("((A+B)-C)")
-        assert p._remove_result_column_from_expr("B") == "((A)-C)"
-
-    # ---------- 边界情况 ----------
-    def test_whole_expression_is_result_column(self):
-        """表达式只有一个 token，且正是结果列本身。"""
-        p = _make_processor("A")
-        assert p._remove_result_column_from_expr("A") == "0"
-
-    def test_lowercase_input_is_normalized(self):
-        """小写输入应被正确识别并移除。"""
-        p = _make_processor("a+b")
-        assert p._remove_result_column_from_expr("A") == "B"
-
-    def test_number_literals_are_not_mistaken_for_identifiers(self):
-        """数字 token 不应被当作标识符。'A*2+B' 移除 'A' → '2+B'。"""
-        p = _make_processor("A*2+B")
-        assert p._remove_result_column_from_expr("A") == "2+B"
-
-    def test_decimal_number_literal_untouched(self):
-        p = _make_processor("A*1.5+B")
-        assert p._remove_result_column_from_expr("A") == "1.5+B"
-    ```
-
-- **tests/test_services_data.py**
-  - language: `python`
-  - content:
-    ```python
-import pandas as pd
-import pytest
-from services.data.reader import DataReader
-from services.data.writer import DataWriter
-from services.data.formatter import DataFormatter
-
-class TestDataReader:
-    def test_read_excel(self, tmp_path):
-        df = pd.DataFrame({'A': [1, 2], 'B': ['x', 'y']})
-        path = tmp_path / 'test.xlsx'
-        df.to_excel(path, index=False)
-        result = DataReader.read_excel(str(path))
-        pd.testing.assert_frame_equal(result, df)
-
-    def test_read_csv(self, tmp_path):
-        df = pd.DataFrame({'A': [1, 2], 'B': ['x', 'y']})
-        path = tmp_path / 'test.csv'
-        df.to_csv(path, index=False)
-        result = DataReader.read_csv(str(path))
-        pd.testing.assert_frame_equal(result, df)
-
-    def test_read_auto_excel(self, tmp_path):
-        df = pd.DataFrame({'A': [1, 2]})
-        path = tmp_path / 'test.xlsx'
-        df.to_excel(path, index=False)
-        result = DataReader.read_auto(str(path))
-        pd.testing.assert_frame_equal(result, df)
-
-    def test_read_auto_csv(self, tmp_path):
-        df = pd.DataFrame({'A': [1, 2]})
-        path = tmp_path / 'test.csv'
-        df.to_csv(path, index=False)
-        result = DataReader.read_auto(str(path))
-        pd.testing.assert_frame_equal(result, df)
-
-    def test_read_auto_unsupported(self, tmp_path):
-        path = tmp_path / 'test.txt'
-        path.write_text('hello')
-        with pytest.raises(ValueError, match='不支持的文件类型'):
-            DataReader.read_auto(str(path))
-
-class TestDataWriter:
-    def test_write_excel(self, tmp_path):
-        df = pd.DataFrame({'A': [1, 2]})
-        path = tmp_path / 'out.xlsx'
-        DataWriter.write_excel(df, str(path))
-        result = pd.read_excel(path)
-        pd.testing.assert_frame_equal(result, df)
-
-    def test_write_csv(self, tmp_path):
-        df = pd.DataFrame({'A': [1, 2]})
-        path = tmp_path / 'out.csv'
-        DataWriter.write_csv(df, str(path))
-        result = pd.read_csv(path)
-        pd.testing.assert_frame_equal(result, df)
-
-    def test_write_auto_excel(self, tmp_path):
-        df = pd.DataFrame({'A': [1, 2]})
-        path = tmp_path / 'out.xlsx'
-        DataWriter.write_auto(df, str(path))
-        result = pd.read_excel(path)
-        pd.testing.assert_frame_equal(result, df)
-
-    def test_write_auto_csv(self, tmp_path):
-        df = pd.DataFrame({'A': [1, 2]})
-        path = tmp_path / 'out.csv'
-        DataWriter.write_auto(df, str(path))
-        result = pd.read_csv(path)
-        pd.testing.assert_frame_equal(result, df)
-
-class TestDataFormatter:
-    def test_round_numeric_columns(self):
-        df = pd.DataFrame({'A': [1.234, 2.345], 'B': ['x', 'y']})
-        result = DataFormatter.round_numeric_columns(df, decimals=2)
-        assert result['A'].tolist() == [1.23, 2.35]
-        assert result['B'].tolist() == ['x', 'y']
-
-    def test_safe_format_dataframe(self):
-        df = pd.DataFrame({'A': [1, None], 'B': ['x', None]})
-        result = DataFormatter.safe_format_dataframe(df)
-        assert result['A'].iloc[0] == 1
-        assert pd.isna(result['A'].iloc[1])
-        assert result['B'].tolist() == ['x', '']
-
-    def test_fillna_empty(self):
-        df = pd.DataFrame({'A': [1, None], 'B': ['x', None]})
-        result = DataFormatter.fillna_empty(df)
-        assert result['A'].tolist() == [1, '']
-        assert result['B'].tolist() == ['x', '']
-    ```
-
-- **tests/test_services_excel.py**
-  - language: `python`
-  - content:
-    ```python
-import pandas as pd
-import pytest
-from services.excel.compute_engine import ComputeEngine
-from core.filter_engine import FilterEngine
-from services.excel.aggregator import Aggregator
-from core.filter_engine import Condition
-
-class TestComputeEngine:
-    def test_evaluate_expression(self):
-        values = {'A': 10, 'B': 5}
-        assert ComputeEngine.evaluate_expression('A+B', values) == 15
-        assert ComputeEngine.evaluate_expression('A*B', values) == 50
-
-    def test_extract_variables(self):
-        assert ComputeEngine.extract_variables('A+B-C') == {'A', 'B', 'C'}
-
-    def test_simple_aggregate(self):
-        df = pd.DataFrame({'G': ['X', 'X', 'Y'], 'V': [10, 20, 5]})
-        result = ComputeEngine.simple_aggregate(df, ['G'], ['V'], 'sum')
-        assert len(result) == 2
-        assert result.loc[result['G'] == 'X', 'V'].iloc[0] == 30
-
-    def test_aggregate_by_keys(self):
-        df = pd.DataFrame({'key': ['A', 'A', 'B'], 'sum': [10, 20, 5], 'other': ['first', 'second', 'other']})
-        result = ComputeEngine.aggregate_by_keys(df, ['key'], ['sum'], ['other'])
-        assert len(result) == 2
-        assert result.loc[result['key'] == 'A', 'sum'].iloc[0] == 30
-        assert result.loc[result['key'] == 'A', 'other'].iloc[0] == 'first'
-
-class TestFilterEngine:
-    def test_filter_dataframe_with_condition_objects(self):
-        df = pd.DataFrame({'name': ['Alice', 'Bob'], 'age': [25, 30]})
-        cond = Condition(field='age', op='>', value=28)
-        result = FilterEngine.filter_dataframe(df, [cond])
-        assert len(result) == 1
-        assert result.iloc[0]['name'] == 'Bob'
-
-    def test_filter_dataframe_with_multi_values(self):
-        df = pd.DataFrame({'dept': ['HR', 'IT', 'HR'], 'name': ['A', 'B', 'C']})
-        result = FilterEngine.filter_dataframe_with_multi_values(df, exact_conditions=[('dept', ['HR'])], fuzzy_conditions=[('name', 'A')])
-        assert len(result) == 1
-        assert result.iloc[0]['name'] == 'A'
-
-    def test_filter_dict(self):
-        row = {'name': 'Alice', 'age': 30}
-        cond = Condition(field='age', op='>', value=25)
-        assert FilterEngine.filter_dict(row, [cond]) is True
-
-    def test_create_condition(self):
-        cond = FilterEngine.create_condition('age', '>', 25, exclude=True)
-        assert cond.field == 'age'
-        assert cond.op == '>'
-        assert cond.value == 25
-        assert cond.exclude is True
-
-class TestAggregator:
-    def test_group_aggregate(self):
-        df = pd.DataFrame({'G': ['X', 'X'], 'V': [10, 20]})
-        result = Aggregator.group_aggregate(df, ['G'], {'V': 'sum'})
-        assert result.iloc[0]['V'] == 30
-
-    def test_aggregate_by_keys_with_other_fields(self):
-        df = pd.DataFrame({'key': ['A', 'A'], 'sum': [10, 20], 'other': ['first', 'second']})
-        result = Aggregator.aggregate_by_keys(df, ['key'], ['sum'], ['other'])
-        assert result.iloc[0]['sum'] == 30
-        assert result.iloc[0]['other'] == 'first'
     ```
 

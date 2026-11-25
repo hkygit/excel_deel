@@ -1,3 +1,192 @@
+- **templates/calculator/index.html**
+  - language: `html`
+  - content:
+    ```html
+{% extends "base.html" %}
+{% block title %}列计算 / 聚合回填{% endblock %}
+{% block content %}
+<h2>🧮 列计算 / 聚合回填</h2>
+<form action="{{ url_for('calc.process') }}" method="post" enctype="multipart/form-data">
+    <div class="form-section">
+        <div class="form-row">
+            <label>📁 上传 Excel 文件</label>
+            <input type="file" name="file" accept=".xlsx,.xls" required>
+        </div>
+        <div class="form-row">
+            <label>⚙️ 操作类型</label>
+            <select name="calc_type" id="calcType">
+                <option value="column">列计算</option>
+                <option value="aggregate">聚合回填</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>表头所在行号（从1开始，默认1）</label>
+            <input type="number" name="header_row" value="1" min="1" style="max-width:100px;">
+            <div class="hint">如果你的 Excel 顶部有标题行，请填写实际列名所在的行号</div>
+        </div>
+    </div>
+    <div id="columnConfig" class="form-section">
+        <h3>📐 列计算设置</h3>
+        <div class="form-row">
+            <label>表达式 (如 A+B-C)</label>
+            <input type="text" name="expression" placeholder="例如 A+B">
+        </div>
+        <div class="form-row">
+            <label>结果列 (字母或新列名)</label>
+            <input type="text" name="result_col_column" placeholder="K 或 '差值'">
+        </div>
+        <div class="form-row">
+            <label>合并依据列 (可选，逗号分隔)</label>
+            <input type="text" name="merge_by_cols" placeholder="A,B">
+            <div class="hint">相同组的结果列只保留第一行，其余合并。</div>
+        </div>
+    </div>
+    <div id="aggregateConfig" class="form-section" style="display:none;">
+        <h3>📊 聚合回填设置</h3>
+        <div class="form-row">
+            <label>分组列 (逗号分隔，支持列名或列字母)</label>
+            <input type="text" name="group_cols" placeholder="A,B">
+        </div>
+        <div class="form-row">
+            <label>聚合列 (逗号分隔)</label>
+            <input type="text" name="agg_cols" placeholder="C,D">
+        </div>
+        <div class="form-row">
+            <label>聚合函数</label>
+            <select name="agg_func">
+                <option value="sum">求和</option>
+                <option value="mean">平均值</option>
+                <option value="max">最大值</option>
+                <option value="min">最小值</option>
+                <option value="count">计数</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>结果列名</label>
+            <input type="text" name="result_col_aggregate" placeholder="K 或 '聚合结果'">
+        </div>
+    </div>
+    <button type="submit" class="btn btn-success">开始处理</button>
+</form>
+<script>
+    const typeSelect = document.getElementById('calcType');
+    const colCfg = document.getElementById('columnConfig');
+    const aggCfg = document.getElementById('aggregateConfig');
+    function toggle() {
+        if (typeSelect.value === 'column') {
+            colCfg.style.display = 'block';
+            aggCfg.style.display = 'none';
+        } else {
+            colCfg.style.display = 'none';
+            aggCfg.style.display = 'block';
+        }
+    }
+    typeSelect.addEventListener('change', toggle);
+    toggle();
+</script>
+{% endblock %}
+    ```
+
+- **templates/checker/index.html**
+  - language: `html`
+  - content:
+    ```html
+{% extends "base.html" %}
+{% block title %}文件校验{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/checker.css') }}">
+{% endblock %}
+{% block content %}
+<h2>✅ 文件校验</h2>
+<p>上传标准文件群和比较文件群，系统将根据您指定的主键和对比列进行比较，并生成差异报告。</p>
+
+<form id="checkerForm" enctype="multipart/form-data">
+    <div class="form-section">
+        <h3>📂 文件上传</h3>
+        <div class="form-row">
+            <label>标准文件群（可多选）</label>
+            <input type="file" id="filesA" name="files_a" accept=".xlsx,.xls,.csv" multiple required>
+        </div>
+        <div class="form-row">
+            <label>比较文件群（可多选）</label>
+            <input type="file" id="filesB" name="files_b" accept=".xlsx,.xls,.csv" multiple required>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>🔑 主键设置</h3>
+        <div class="form-row">
+            <label>标准群主键列（逗号或空格分隔）</label>
+            <input type="text" id="keyMapA" placeholder="例如 ID,日期">
+        </div>
+        <div class="form-row">
+            <label>比较群主键列（逗号或空格分隔，默认与标准相同）</label>
+            <input type="text" id="keyMapB" placeholder="留空则与标准群主键相同">
+        </div>
+        <div class="form-row">
+            <label>主键重复处理</label>
+            <select id="duplicateAction">
+                <option value="error" selected>报错</option>
+                <option value="keep_first">保留第一条</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>📊 对比列</h3>
+        <div class="parser-container" style="display: flex; gap: 20px;">
+            <div class="parser-box" style="flex: 1;">
+                <label>标准群对比列（每行一个或用逗号/空格分隔）</label>
+                <textarea id="compareStandardText" rows="5" placeholder="例如：医疗类别&#10;入院日期&#10;出院日期&#10;医疗费总额&#10;结算时间&#10;定点医药机构名称"></textarea>
+            </div>
+            <div class="parser-box" style="flex: 1;">
+                <label>比较群对比列（留空则与标准相同）</label>
+                <textarea id="compareCompareText" rows="5" placeholder="例如：医疗类别&#10;入院日期&#10;出院日期&#10;医疗费总额&#10;结算时间&#10;定点医疗机构名称"></textarea>
+            </div>
+        </div>
+        <div class="hint">按顺序一一对应，支持多列；比较群留空则默认与标准群列名相同。</div>
+    </div>
+
+    <div class="form-section">
+        <h3>🔍 标准群筛选（可选）</h3>
+        <div id="filtersContainer"></div>
+        <button type="button" class="btn btn-secondary" onclick="addFilter()">+ 添加筛选条件</button>
+        <div class="hint">支持多值OR：在“值”中用英文逗号分隔多个值</div>
+    </div>
+
+    <div style="text-align:center; margin: 30px 0;">
+        <button type="button" class="btn" id="btnPrecheck">🔎 预检</button>
+        <button type="button" class="btn btn-success" id="btnStart" disabled>▶ 开始校验</button>
+    </div>
+</form>
+
+<div id="statusArea" class="status-area" style="display:none;">
+    <h3>任务状态</h3>
+    <div class="progress"><div id="progressBar" class="progress-bar" style="width:0%"></div></div>
+    <p><strong>状态：</strong> <span id="taskStatus">等待中</span></p>
+    <p id="progressMessage" style="color:#666;"></p>
+    <div id="precheckResult" class="precheck-result"></div>
+    <div id="downloadLink" style="margin-top:15px;"></div>
+</div>
+
+<template id="filterRowTemplate">
+    <div class="filter-row">
+        <input type="text" name="filter_field" placeholder="字段名" class="filter-field">
+        <select name="filter_op" class="filter-op">
+            <option value="=">=</option><option value="!=">!=</option><option value=">">></option>
+            <option value="<"><</option><option value=">=">>=</option><option value="<="><=</option>
+            <option value="contains">包含</option><option value="not_contains">不包含</option>
+        </select>
+        <input type="text" name="filter_value" placeholder="值（多值用英文逗号）" class="filter-value">
+        <button type="button" class="btn btn-danger" onclick="this.parentElement.remove()">删除</button>
+    </div>
+</template>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/checker.js') }}"></script>
+{% endblock %}
+    ```
+
 - **templates/comparator/index.html**
   - language: `html`
   - content:
@@ -308,10 +497,17 @@
             <div class="hint">输入列字母覆盖该列；输入其他新建列</div>
         </div>
         <div class="form-row">
-            <label>
-                <input type="checkbox" name="allow_duplicate_keys" id="allowDupKeys">
-                允许目标键重复（仅将源值填充到首次出现的行，其余行保持不变）
-            </label>
+            <label>目标键重复时的处理方式</label>
+            <select name="duplicate_action" id="duplicateAction">
+                <option value="error" selected>报错（检测到重复键时中止）</option>
+                <option value="first">只填充第一个匹配行（其余行保留原值）</option>
+                <option value="all">填充所有匹配行（每行都写入相同值）</option>
+            </select>
+            <div class="hint">
+                仅当目标文件的主键列存在重复值时生效。
+                "只填充第一个"适合一个 key 只对应一条业务的场景；
+                "填充所有"适合一个 key 对应多条业务记录的场景。
+            </div>
         </div>
     </div>
     <div class="button-group">
@@ -1576,347 +1772,5 @@ class TestConvertService:
         result = service.precheck()
         assert 'total_rows' in result
         assert result['total_rows'] == 2
-    ```
-
-- **tests/test_core_task.py**
-  - language: `python`
-  - content:
-    ```python
-# tests/test_core_task.py
-"""TaskStorage / TaskManager 测试。
-
-覆盖：
-- 基础 CRUD（save / load / update / delete）
-- 未知字段的 extra 往返与合并
-- 任务日志隔离
-- WAL 模式已启用
-- 崩溃恢复（recover_orphan_tasks）
-- 多线程并发更新不丢数据
-- 旧 JSON 文件自动迁移
-- TaskManager 状态机
-"""
-import json
-import os
-import sqlite3
-import threading
-
-import pytest
-
-from core.task.storage import TaskStorage
-from core.task.manager import TaskManager
-from core.task.state import TaskStatus
-from core.task.base import Task
-
-
-class DummyTask(Task):
-    def __init__(self, should_fail=False, result_data=None):
-        self.should_fail = should_fail
-        self.result_data = result_data or {"output": "success"}
-
-    def execute(self):
-        if self.should_fail:
-            raise ValueError("模拟任务失败")
-        return self.result_data
-
-
-# ============================================================================
-# TaskStorage
-# ============================================================================
-class TestTaskStorage:
-    @pytest.fixture
-    def storage(self, tmp_path):
-        status_dir = tmp_path / "status"
-        output_dir = tmp_path / "output"
-        return TaskStorage(str(status_dir), str(output_dir))
-
-    # ---------- 基础 CRUD ----------
-    def test_save_and_load(self, storage):
-        task_id = "test-123"
-        data = {"status": "pending", "value": 42}
-        storage.save(task_id, data)
-        loaded = storage.load(task_id)
-        assert loaded["value"] == 42
-        assert loaded["status"] == "pending"
-        assert loaded["task_id"] == task_id
-
-    def test_update(self, storage):
-        task_id = "test-123"
-        storage.save(task_id, {"status": "pending"})
-        storage.update(task_id, status="completed", result="ok")
-        loaded = storage.load(task_id)
-        assert loaded["status"] == "completed"
-        assert loaded["result"] == "ok"
-
-    def test_delete(self, storage):
-        task_id = "delete-me"
-        storage.save(task_id, {})
-        assert storage.load(task_id) is not None
-        storage.delete(task_id)
-        assert storage.load(task_id) is None
-
-    def test_update_nonexistent_raises(self, storage):
-        with pytest.raises(ValueError, match="not found"):
-            storage.update("does-not-exist", status="completed")
-
-    # ---------- extra 字段 ----------
-    def test_extra_fields_roundtrip(self, storage):
-        task_id = "extra-test"
-        storage.save(
-            task_id,
-            {"status": "pending", "custom_a": 1, "custom_b": "x"},
-        )
-        loaded = storage.load(task_id)
-        assert loaded["custom_a"] == 1
-        assert loaded["custom_b"] == "x"
-
-    def test_extra_field_merges_on_update(self, storage):
-        task_id = "merge-test"
-        storage.save(task_id, {"status": "pending", "custom_a": 1})
-        storage.update(task_id, custom_b=2)
-        loaded = storage.load(task_id)
-        assert loaded["custom_a"] == 1
-        assert loaded["custom_b"] == 2
-
-    def test_params_dict_roundtrip(self, storage):
-        """params 字典应通过 JSON 往返无损。"""
-        task_id = "params-test"
-        params = {"file": "x.csv", "options": {"sep": ",", "enc": "utf-8"}}
-        storage.save(task_id, {"status": "pending", "params": params})
-        loaded = storage.load(task_id)
-        assert loaded["params"] == params
-
-    # ---------- 日志 ----------
-    def test_append_and_get_log(self, storage):
-        task_id = "log-test"
-        storage.append_log(task_id, "first line")
-        storage.append_log(task_id, "second line")
-        log = storage.get_log(task_id)
-        assert "first line" in log
-        assert "second line" in log
-        # 顺序应保持
-        assert log.index("first line") < log.index("second line")
-
-    def test_logs_isolated_by_task(self, storage):
-        storage.append_log("task-1", "hello 1")
-        storage.append_log("task-2", "hello 2")
-        assert "hello 1" in storage.get_log("task-1")
-        assert "hello 2" not in storage.get_log("task-1")
-
-    def test_get_log_limit(self, storage):
-        for i in range(10):
-            storage.append_log("many", f"line-{i}")
-        log = storage.get_log("many", max_lines=3)
-        # 应该只保留最后 3 行
-        assert "line-7" in log
-        assert "line-8" in log
-        assert "line-9" in log
-        assert "line-0" not in log
-
-    # ---------- SQLite 特性 ----------
-    def test_wal_mode_enabled(self, storage):
-        conn = sqlite3.connect(storage.db_path)
-        try:
-            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-            assert mode.lower() == "wal"
-        finally:
-            conn.close()
-
-    def test_db_file_created(self, storage):
-        assert os.path.exists(storage.db_path)
-        assert storage.db_path.endswith("tasks.db")
-
-    # ---------- 崩溃恢复 ----------
-    def test_recover_orphan_tasks(self, storage):
-        storage.save("orphan-1", {"status": "running"})
-        storage.save("orphan-2", {"status": "pending"})
-        storage.save("done-1", {"status": "completed"})
-        storage.save("failed-1", {"status": "failed"})
-
-        count = storage.recover_orphan_tasks()
-        assert count == 2
-
-        assert storage.load("orphan-1")["status"] == "failed"
-        assert storage.load("orphan-2")["status"] == "failed"
-        assert storage.load("done-1")["status"] == "completed"
-        assert storage.load("failed-1")["status"] == "failed"
-        # 错误信息应该保留提示
-        assert "服务重启" in storage.load("orphan-1")["error"]
-
-    def test_recover_orphan_tasks_empty(self, storage):
-        """没有 pending/running 时返回 0。"""
-        storage.save("x", {"status": "completed"})
-        assert storage.recover_orphan_tasks() == 0
-
-    # ---------- 并发 ----------
-    def test_concurrent_updates_do_not_lose_data(self, tmp_path):
-        """多线程同时更新同一 task 的不同字段，字段不应丢失。"""
-        storage = TaskStorage(
-            str(tmp_path / "s"), str(tmp_path / "o")
-        )
-        storage.save("conc", {"status": "running"})
-
-        def worker(i):
-            storage.update("conc", **{f"field_{i}": i})
-
-        threads = [
-            threading.Thread(target=worker, args=(i,)) for i in range(20)
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        loaded = storage.load("conc")
-        for i in range(20):
-            assert loaded.get(f"field_{i}") == i, f"field_{i} lost"
-
-    # ---------- 旧 JSON 迁移 ----------
-    def test_json_migration(self, tmp_path):
-        """旧的 .json 任务文件应被迁移到 SQLite。"""
-        status_dir = tmp_path / "status"
-        status_dir.mkdir()
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
-
-        legacy = {
-            "task_id": "legacy-1",
-            "status": "completed",
-            "created_at": "2026-01-01T00:00:00",
-            "result_path": "/tmp/x.xlsx",
-        }
-        (status_dir / "legacy-1.json").write_text(
-            json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
-        )
-        (status_dir / "legacy-1.log").write_text(
-            "[2026-01-01 00:00:01] hello\n"
-            "[2026-01-01 00:00:02] world\n",
-            encoding="utf-8",
-        )
-
-        # 初始化时自动迁移
-        storage = TaskStorage(str(status_dir), str(output_dir))
-
-        loaded = storage.load("legacy-1")
-        assert loaded is not None
-        assert loaded["status"] == "completed"
-        assert loaded["result_path"] == "/tmp/x.xlsx"
-
-        log = storage.get_log("legacy-1")
-        assert "hello" in log
-        assert "world" in log
-
-        # 旧文件应被移动到 .migrated/
-        migrated = status_dir / ".migrated"
-        assert migrated.is_dir()
-        assert (migrated / "legacy-1.json").exists()
-
-    def test_json_migration_skips_corrupt(self, tmp_path):
-        """损坏的 JSON 文件不应阻塞其他文件的迁移。"""
-        status_dir = tmp_path / "status"
-        status_dir.mkdir()
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
-
-        (status_dir / "corrupt.json").write_text(
-            "{not valid json", encoding="utf-8"
-        )
-        (status_dir / "good.json").write_text(
-            json.dumps({"task_id": "good", "status": "completed"}),
-            encoding="utf-8",
-        )
-
-        storage = TaskStorage(str(status_dir), str(output_dir))
-        assert storage.load("good") is not None
-        # 损坏的文件保持原样（不能被识别为有效任务）
-        assert storage.load("corrupt") is None
-
-
-# ============================================================================
-# TaskManager（状态机）
-# ============================================================================
-class TestTaskManager:
-    @pytest.fixture
-    def storage(self, tmp_path):
-        status_dir = tmp_path / "status"
-        output_dir = tmp_path / "output"
-        return TaskStorage(str(status_dir), str(output_dir))
-
-    @pytest.fixture
-    def manager(self, storage):
-        return TaskManager(storage)
-
-    def test_create_task(self, manager):
-        params = {"file": "test.csv"}
-        task_id = manager.create_task(params, original_filename="test")
-        assert task_id is not None
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.PENDING
-        assert status["params"] == params
-
-    def test_submit_and_complete(self, manager):
-        task_id = manager.create_task({})
-        manager.storage.update(task_id, status=TaskStatus.RUNNING)
-        manager.complete_task(
-            task_id, result_path="/out.xlsx", total_input_rows=100
-        )
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.COMPLETED
-        assert status["result_path"] == "/out.xlsx"
-
-    def test_fail_task(self, manager):
-        task_id = manager.create_task({})
-        manager.fail_task(task_id, error="Something wrong")
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.FAILED
-        assert status["error"] == "Something wrong"
-
-    def test_cancel_task(self, manager):
-        task_id = manager.create_task({})
-        manager.cancel_task(task_id)
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.CANCELLED
-
-    def test_manager_with_recover(self, manager, storage):
-        """模拟服务重启后，遗留的 running 任务应被恢复。"""
-        task_id = manager.create_task({})
-        manager.storage.update(task_id, status=TaskStatus.RUNNING)
-        # 模拟重启
-        count = storage.recover_orphan_tasks()
-        assert count == 1
-        status = manager.storage.load(task_id)
-        assert status["status"] == TaskStatus.FAILED
-    ```
-
-- **tests/test_data_access_layer.py**
-  - language: `python`
-  - content:
-    ```python
-import pytest
-import pandas as pd
-from core.data_access_layer import DataAccessLayer
-
-class TestDataAccessLayer:
-    def test_auto_clean_strings(self):
-        dal = DataAccessLayer()
-        df = pd.DataFrame({'A': [' 10 ', '20', ' 30 ']})
-        cleaned = dal._auto_clean_dataframe(df)
-        # 数值转换后应为数字，但测试允许字符串或数字（向后兼容）
-        assert cleaned['A'].tolist() == [10.0, 20.0, 30.0] or cleaned['A'].tolist() == ['10', '20', '30']
-
-    def test_dtype_hints(self):
-        dal = DataAccessLayer()
-        df = pd.DataFrame({'amount': ['100', '200', 'invalid']})
-        cleaned = dal._auto_clean_dataframe(df, dtype_hints={'amount': float})
-        # dtype_hints 会强制转换，无效值变为 NaN
-        assert cleaned['amount'].isna().sum() == 1
-
-    def test_empty_string_handling(self):
-        dal = DataAccessLayer()
-        df = pd.DataFrame({'A': ['', '   ', '10']})
-        cleaned = dal._auto_clean_dataframe(df)
-        # 空字符串变为 NaN，'10' 转为数字或保持字符串
-        assert pd.isna(cleaned['A'].iloc[0])
-        assert pd.isna(cleaned['A'].iloc[1])
-        assert cleaned['A'].iloc[2] == 10.0 or cleaned['A'].iloc[2] == '10'
     ```
 

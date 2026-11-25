@@ -28,6 +28,7 @@ from services.excel.aggregator import Aggregator
 from services.field_parser import FieldParserService
 from services.checker import CheckerService
 from services.convert.service import ConvertService
+from services.concat import ConcatService
 from services.team_report import TeamReportService
 from services.team_report.writer import TeamReportExcelWriter
 
@@ -50,6 +51,7 @@ class Container(containers.DeclarativeContainer):
     field_parser_config = providers.Callable(lambda s: s.field_parser, config)
     team_report_config = providers.Callable(lambda s: s.team_report, config)
     convert_config = providers.Callable(lambda s: s.convert, config)
+    concat_config = providers.Callable(lambda s: s.concat, config)
 
     # ==================== 任务存储 ====================
     task_storage = providers.Singleton(
@@ -96,3 +98,7 @@ class Container(containers.DeclarativeContainer):
         config=checker_config,
     )
     convert_service = providers.Factory(ConvertService)
+    concat_service = providers.Factory(
+        ConcatService,
+        config=concat_config,
+    )

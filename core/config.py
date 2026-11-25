@@ -58,6 +58,14 @@ class TeamReportConfig(BaseSettings):
     static_supervisor_mapping: dict = {'徐国宝': '任翔', '王国平': '任凯', '安会阳': '任翔', '任翔': '任翔', '项红伟': '任翔', '马长领': '任翔', '袁茂启': '方行', '余和斌': '任翔', '夏海洋': '方行', '任凯': '任凯', '王哲': '方行', '王妙恩': '方行', '方行': '方行', '黄伟昌': '方行', '金忠健': '任凯', '蒋小峰': '方行', '童圣君': '任翔', '陈仪端': '任凯', '刘美乐': '方行', '黄一鹏': '任翔', '王凤梨': '任翔', '鲍腊九': '任凯', '王天剑': '任凯', '陈旭东': '任凯', '王林': '方行'}
     model_config = {"env_prefix": "TEAM_"}
 
+
+class ConcatConfig(BaseSettings):
+    """分组拼接专用配置"""
+    max_file_size_bytes: int = 10 * 1024 * 1024   # 10MB 上限
+    max_cell_chars: int = 32767                   # Excel 单元格字符上限
+    model_config = {"env_prefix": "CONCAT_"}
+
+
 class Settings(BaseSettings):
     secret_key: str = Field("dev-key")
     upload_folder: str = "uploads"
@@ -69,6 +77,7 @@ class Settings(BaseSettings):
     field_parser: FieldParserConfig = FieldParserConfig()
     team_report: TeamReportConfig = TeamReportConfig()
     convert: ConvertConfig = ConvertConfig()
+    concat: ConcatConfig = ConcatConfig()
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 settings = Settings()

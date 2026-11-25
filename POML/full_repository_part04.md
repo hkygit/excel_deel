@@ -1288,7 +1288,23 @@ class ExcelMatcher:
         self.target_ws = None
         self.source_df = None
         self.data_reader = data_reader or DataReader()
-        self.allow_duplicate_keys = config.get('allow_duplicate_keys', False)
+
+        # 解析 duplicate_action（新参数），并与旧参数 allow_duplicate_keys 兼容
+        # 优先级：duplicate_action 合法值 > allow_duplicate_keys=True → 'first' > 'error'
+        _action = config.get('duplicate_action', '')
+        if isinstance(_action, str):
+            _action = _action.strip().lower()
+        if _action not in ('error', 'first', 'all'):
+            if config.get('allow_duplicate_keys'):
+                _action = 'first'
+            else:
+                _action = 'error'
+        self.duplicate_action = _action
+        # 向后兼容：保留旧属性名，供外部潜在读取（内部逻辑统一用 duplicate_action）
+        self.allow_duplicate_keys = (_action != 'error')
+
+        # 优化 5：校验报告开关，默认开启（向后兼容）
+        self.generate_report = config.get('generate_report', True)
 
         # 解析配置
         self.target_key_cols = config['target_key_cols']          # 列字母列表，如 ['A', 'B']
@@ -1393,16 +1409,45 @@ class ExcelMatcher:
             return False
 
     def _extract_target_keys(self):
-        """提取目标文件中所有行的组合主键"""
+        """提取目标文件中所有行的组合主键
+
+        性能优化（优化 3）：
+        先一次性检测 key 列是否与任何合并区间相交。
+        - 不相交：走 ws.cell(row, col).value 快速路径，跳过 O(M) 的 merged_cells 遍历
+        - 相交：走 get_cell_value 慢路径（原逻辑），保证合并单元格取值正确
+
+        两种路径在"key 列不在合并区间"时结果完全一致：
+        get_cell_value 的内部循环此时必不命中，返回值就是 cell.value。
+        """
         start_row = 2
         end_row = self.target_ws.max_row
         keys = []
-        for row in range(start_row, end_row + 1):
-            key = []
-            for col in self.target_key_indices:
-                val = self.target_wb.get_cell_value(row, col, sheet=self.target_ws)
-                key.append(str(val).strip() if val else '')
-            keys.append(tuple(key))
+
+        # 检测 key 列是否与任何合并区间相交（一次性开销，避免 R 次重复遍历）
+        key_cols_set = set(self.target_key_indices)
+        key_in_merge = False
+        for merged in self.target_ws.merged_cells.ranges:
+            if any(merged.min_col <= c <= merged.max_col for c in key_cols_set):
+                key_in_merge = True
+                break
+
+        ws = self.target_ws
+        if key_in_merge:
+            # 慢速路径：key 列可能被合并，需走 get_cell_value
+            for row in range(start_row, end_row + 1):
+                key = []
+                for col in self.target_key_indices:
+                    val = self.target_wb.get_cell_value(row, col, sheet=ws)
+                    key.append(str(val).strip() if val else '')
+                keys.append(tuple(key))
+        else:
+            # 快速路径：直接读 cell.value
+            for row in range(start_row, end_row + 1):
+                key = []
+                for col in self.target_key_indices:
+                    val = ws.cell(row, col).value
+                    key.append(str(val).strip() if val else '')
+                keys.append(tuple(key))
         return keys, start_row, end_row
 
     def _build_lookup_dict(self):
@@ -1455,10 +1500,13 @@ class ExcelMatcher:
                 self.target_ws.unmerge_cells(str(merged))
 
         # 写入数据
-        seen_keys = set()
+        # duplicate_action='first'：跳过重复键，仅填充第一个匹配行（其余行保留原值）
+        # duplicate_action='all'  ：不跳过，所有匹配行都填充相同值
+        # duplicate_action='error'：match() 已提前报错，正常不会走到重复键分支
+        seen_keys = set() if self.duplicate_action == 'first' else None
         for row_offset, key in enumerate(keys):
             row_num = start_row + row_offset
-            if self.allow_duplicate_keys:
+            if seen_keys is not None:
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
@@ -1479,17 +1527,27 @@ class ExcelMatcher:
             for idx in self.result_col_indices:
                 copy_merge_structure(self.target_ws, ref_col, self.target_ws, idx, start_row, self.target_ws.max_row)
 
-        # 设置右对齐
+        # 设置右对齐（优化 4：Alignment 对象提到循环外复用，openpyxl 按值存储样式索引，等价）
+        right_align = Alignment(horizontal='right')
         for idx in self.result_col_indices:
             for row in range(start_row, self.target_ws.max_row + 1):
                 cell = self.target_ws.cell(row, idx)
-                cell.alignment = Alignment(horizontal='right')
+                cell.alignment = right_align
 
-    def _generate_report(self, used_target_keys, lookup, start_row):
-        """生成校验报告 sheet，展示所有源值列的值"""
-        target_keys_full, _, _ = self._extract_target_keys()
+    def _generate_report(self, used_target_keys, lookup, start_row, target_keys_full=None):
+        """生成校验报告 sheet，展示所有源值列的值
+
+        性能优化：
+        - 优化 2：target_keys_full 可由调用方传入，避免重复调用 _extract_target_keys
+        - 优化 1：set(target_keys_used) 提到循环外，避免 O(S*R) 的重复哈希
+        - 优化 4：Alignment 对象提到循环外复用
+        """
+        if target_keys_full is None:
+            target_keys_full, _, _ = self._extract_target_keys()
         target_keys_used = used_target_keys
         source_keys_set = set(lookup.keys())
+        # 优化 1：提前构建 target_keys_used 的 set，避免在"仅源文件"循环里每次重建
+        target_keys_used_set = set(target_keys_used)
 
         # 准备列标题：行号、目标键、源匹配键、每个源值列的值、匹配状态、备注
         header_row = 1
@@ -1540,8 +1598,9 @@ class ExcelMatcher:
                 row_idx += 1
 
         # 仅源文件存在的记录
+        # 优化 1：使用提前构建好的 target_keys_used_set，避免 O(S*R) 的重复哈希
         for key, val_tuple in lookup.items():
-            if key not in set(target_keys_used):
+            if key not in target_keys_used_set:
                 row_data = ['-', '', "|".join(str(v) for v in key)]
                 for col_idx in range(len(self.source_value_cols)):
                     val = val_tuple[col_idx] if col_idx < len(val_tuple) else ''
@@ -1552,11 +1611,14 @@ class ExcelMatcher:
                     report_sheet.cell(row_idx, col_idx).value = val
                 row_idx += 1
 
-        # 设置对齐
+        # 设置对齐（优化 4：Alignment 对象提到循环外复用）
+        left_align = Alignment(horizontal='left')
+        right_align = Alignment(horizontal='right')
         for col in range(1, len(headers) + 1):
+            align = left_align if col == 1 else right_align
             for row in range(2, row_idx):
                 cell = report_sheet.cell(row, col)
-                cell.alignment = Alignment(horizontal='right' if col > 1 else 'left')
+                cell.alignment = align
 
     def match(self):
         if not self._validate_column_letters():
@@ -1568,11 +1630,11 @@ class ExcelMatcher:
 
         target_keys, start_row, end_row = self._extract_target_keys()
 
-        if not self.allow_duplicate_keys:
+        if self.duplicate_action == 'error':
             duplicates = self._check_duplicate_target_keys(target_keys)
             if duplicates:
                 dup_examples = [f"'{k}'" for k in list(duplicates)[:5]]
-                self.errors.append(f"目标文件键列存在重复值: {', '.join(dup_examples)}。如需继续填充，请勾选“允许目标键重复”。")
+                self.errors.append(f"目标文件键列存在重复值: {', '.join(dup_examples)}。如需继续填充，请将'目标键重复时的处理方式'设为'只填充第一个'或'填充所有匹配行'。")
                 return False, self.errors
 
         lookup = self._build_lookup_dict()
@@ -1583,7 +1645,11 @@ class ExcelMatcher:
         self._write_result_columns(used_target_keys, lookup, start_row)
 
         # 生成报告（多列版本）
-        self._generate_report(used_target_keys, lookup, start_row)
+        # 优化 2：把已算好的 target_keys 传进去，避免 _generate_report 重新提取
+        # 优化 5：generate_report=False 时跳过报告生成（大文件场景显著提速）
+        if self.generate_report:
+            self._generate_report(used_target_keys, lookup, start_row,
+                                  target_keys_full=target_keys)
 
         out_path = os.path.join(os.path.dirname(self.target_path), f"matched_{os.path.basename(self.target_path)}")
         self.target_wb.save(out_path)
@@ -1785,180 +1851,5 @@ class FieldParserService:
   - content:
     ```python
 # services/subtotal/__init__.py
-    ```
-
-- **services/subtotal/engine.py**
-  - language: `python`
-  - content:
-    ```python
-# services/subtotal/engine.py
-import os
-import openpyxl
-from openpyxl.styles import PatternFill, Font, Border, Side
-from openpyxl.utils import column_index_from_string, get_column_letter
-from core.csv_utils import split_fields
-from core.header_detection import SimpleExcelHeaderDetector
-from core.file_naming import generate_output_filename
-
-SUBTOTAL_FILL = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-SUBTOTAL_FONT = Font(bold=True)
-THIN_BORDER = Border(left=Side('thin'), right=Side('thin'), top=Side('thin'), bottom=Side('thin'))
-
-def _build_header_map(ws):
-    """根据工作表第一行构建列名 -> 列字母的映射"""
-    header_map = {}
-    for cell in ws[1]:
-        if cell.value is not None:
-            col_letter = get_column_letter(cell.column)
-            header_map[str(cell.value).strip()] = col_letter
-    return header_map
-
-def resolve_single_col(token, header_map):
-    """解析单个列标识（字母或列名），返回1-based列索引"""
-    try:
-        return column_index_from_string(token)
-    except (ValueError, KeyError):
-        if token in header_map:
-            return column_index_from_string(header_map[token])
-        raise ValueError(f"无效的列标识: {token}")
-
-def parse_cols_with_header(raw, header_map):
-    """解析列字符串（支持范围、列名），返回列索引列表"""
-    if not raw:
-        return []
-    items = split_fields(raw)
-    result = []
-    for item in items:
-        if '-' in item:
-            start_str, end_str = item.split('-', 1)
-            start_idx = resolve_single_col(start_str.strip(), header_map)
-            end_idx = resolve_single_col(end_str.strip(), header_map)
-            for i in range(start_idx, end_idx + 1):
-                result.append(i)
-        else:
-            result.append(resolve_single_col(item.strip(), header_map))
-    return sorted(list(set(result)))
-
-class SubtotalEngine:
-    def __init__(self, filepath, key_cols_str, calc_cols_str, agg_funcs,
-                 dimension_cols=None, sheets='1', original_filename='data.xlsx'):
-        self.filepath = filepath
-        self.original_filename = original_filename
-        self.key_cols_raw = key_cols_str
-        self.calc_cols_raw = calc_cols_str
-        self.dimension_cols_raw = dimension_cols or ''
-        self.agg_funcs = agg_funcs
-        self.sheets = sheets
-        self.detector = SimpleExcelHeaderDetector()
-        self.key_cols = []
-        self.calc_cols = []
-        self.dimension_cols = []
-
-    def _get_agg_func(self, col_letter):
-        return self.agg_funcs.get(col_letter, self.agg_funcs.get('default', 'sum'))
-
-    def process(self):
-        wb = openpyxl.load_workbook(self.filepath)
-        first_ws = wb.active
-        header_map = _build_header_map(first_ws)
-
-        self.key_cols = parse_cols_with_header(self.key_cols_raw, header_map)
-        self.calc_cols = parse_cols_with_header(self.calc_cols_raw, header_map)
-        if self.dimension_cols_raw:
-            self.dimension_cols = parse_cols_with_header(self.dimension_cols_raw, header_map)
-
-        header_result = self.detector.detect_from_workbook(wb)
-        data_start_excel_row = header_result.get_data_start_excel_row()
-
-        sheet_names = wb.sheetnames
-        if self.sheets == 'all':
-            target_sheets = sheet_names
-        else:
-            indices = [int(x.strip()) for x in self.sheets.split(',') if x.strip().isdigit()]
-            target_sheets = [sheet_names[i-1] for i in indices if 1 <= i <= len(sheet_names)]
-
-        for sheet_name in target_sheets:
-            ws = wb[sheet_name]
-            self._process_sheet(ws, data_start_excel_row)
-
-        out_name = generate_output_filename('subtotal', self.original_filename)
-        out_dir = os.path.dirname(self.filepath)
-        out_path = os.path.join(out_dir, out_name)
-        wb.save(out_path)
-        wb.close()
-        return out_path
-
-    def _process_sheet(self, ws, data_start_row):
-        max_col = ws.max_column
-        max_row = ws.max_row
-        if data_start_row > max_row:
-            return
-
-        groups = {}
-        for row_idx in range(data_start_row, max_row + 1):
-            key = tuple(ws.cell(row_idx, col).value for col in self.key_cols)
-            # ---- 修复：跳过主键全为空的行（避免生成无意义的小计行） ----
-            if all(v is None or str(v).strip() == '' for v in key):
-                continue
-            groups.setdefault(key, []).append(row_idx)
-
-        # 如果没有有效组，直接返回
-        if not groups:
-            return
-
-        sorted_groups = sorted(groups.items(), key=lambda x: max(x[1]), reverse=True)
-
-        for key, rows in sorted_groups:
-            last_row = max(rows)
-            ws.insert_rows(last_row + 1)
-            subtotal_row = last_row + 1
-
-            for col_idx in range(1, max_col + 1):
-                cell = ws.cell(subtotal_row, col_idx)
-                cell.fill = SUBTOTAL_FILL
-                cell.font = SUBTOTAL_FONT
-                cell.border = THIN_BORDER
-
-            for i, col in enumerate(self.key_cols):
-                ws.cell(subtotal_row, col).value = key[i]
-
-            for col in self.dimension_cols:
-                ws.cell(subtotal_row, col).value = '合计'
-
-            for col in self.calc_cols:
-                col_letter = get_column_letter(col)
-                func = self._get_agg_func(col_letter)
-                values = []
-                for r in rows:
-                    val = ws.cell(r, col).value
-                    try:
-                        val = float(val)
-                    except (TypeError, ValueError):
-                        val = 0
-                    values.append(val)
-
-                if func == 'sum':
-                    result = sum(values)
-                elif func == 'avg':
-                    result = sum(values) / len(values) if values else 0
-                elif func == 'min':
-                    result = min(values) if values else 0
-                elif func == 'max':
-                    result = max(values) if values else 0
-                elif func == 'count':
-                    result = len(values)
-                else:
-                    result = sum(values)
-                ws.cell(subtotal_row, col).value = result
-    ```
-
-- **services/team_report/__init__.py**
-  - language: `python`
-  - content:
-    ```python
-# services/team_report/__init__.py
-"""车队日报服务"""
-from .service import TeamReportService
-from .writer import TeamReportExcelWriter
     ```
 
